@@ -1,0 +1,3 @@
+import os
+
+GCP_PROJECT_NUMBER = os.getenv("MG_GCP_PROJECT_NUMBER")
