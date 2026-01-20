@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mg"
-version = "3.0.3"
+version = "3.0.4"
 authors = [
     {name = "Gabe Garrido", email = "gabriel.garrido28@gmail.com"},
 ]
@@ -25,9 +25,8 @@ dependencies = [
     "sqlalchemy==1.4.47",
     "python-tds==1.12.0",
     "sqlalchemy-pytds==0.3.5",
-    "pyodbc==4.0.39",
     "postgres==4.0",
-    "psycopg2==2.9.7",
+    "psycopg2-binary>=2.9.7",
     "unidecode==1.3.8",
     "psutil==6.0.0",
     "python-Levenshtein==0.26.0",
@@ -40,6 +39,9 @@ dependencies = [
     "google-cloud-secret-manager==2.17.0",
     "google-cloud-pubsub==2.29.0"
     ]
+
+[project.optional-dependencies]
+sqlserver = ["pyodbc>=4.0.39"]
 
 # Correct format is a direct array, not a nested structure
 license-files = ["LICENSE"]
