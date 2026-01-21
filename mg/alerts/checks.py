@@ -1,6 +1,6 @@
 import logging
 import subprocess
-from alerts import BaseCheck, register_check_type
+from mg.alerts.alerts import BaseCheck, register_check_type
 
 
 class MacCheck(BaseCheck):
@@ -9,7 +9,7 @@ class MacCheck(BaseCheck):
     def __init__(self, alert_config):
         super().__init__(alert_config)
         try:
-            from constants import MAC_HOST
+            from mg.alerts.constants import MAC_HOST
 
             self.mac_host = MAC_HOST
         except ImportError:

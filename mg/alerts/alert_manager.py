@@ -2,12 +2,12 @@ import os
 
 from mg.db.postgres_manager import PostgresManager
 from mg.logging.logger_manager import LoggerManager
-from notification import send_email_alert  # Import your existing function
+from mg.alerts.notification import send_email_alert  # Import your existing function
 
 # Import our new alert system
-from alerts import BaseCheck
-import stale_checks  # Import to register the StaleCheck type
-import checks  # Import to register the MacCheck type
+from mg.alerts.alerts import BaseCheck
+from mg.alerts import stale_checks  # Import to register the StaleCheck type
+from mg.alerts import checks  # Import to register the MacCheck type
 
 
 class AlertManager:
