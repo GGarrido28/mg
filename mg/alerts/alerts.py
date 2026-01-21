@@ -63,7 +63,7 @@ class BaseCheck:
 
             # First check the alert_type field
             if alert_type == "stale_data":
-                from stale_checks import StaleCheck
+                from mg.alerts.stale_checks import StaleCheck
 
                 return StaleCheck(alert_config)
 
@@ -76,7 +76,7 @@ class BaseCheck:
 
             # Special case for "Check Mac" - exact match
             if alert_name == "Check Mac":
-                from checks import MacCheck
+                from mg.alerts.checks import MacCheck
 
                 return MacCheck(alert_config)
 
@@ -84,7 +84,7 @@ class BaseCheck:
             if alert_config.get("monitored_table") and alert_config.get(
                 "monitored_column"
             ):
-                from stale_checks import StaleCheck
+                from mg.alerts.stale_checks import StaleCheck
 
                 return StaleCheck(alert_config)
 
