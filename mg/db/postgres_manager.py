@@ -533,10 +533,15 @@ class PostgresManager:
             logging.warning(error_msg)
             return (False, error_msg) if return_error_msg else False
         except psycopg2.OperationalError as e:
-            # Handle connection issues
+            # Handle connection issues (e.g., idle-in-transaction timeout)
             error_msg = f"Database connection error: {e}"
             logging.error(error_msg)
-            # You might want to attempt reconnection here
+            self.connect_with_retries()
+            return (False, error_msg) if return_error_msg else False
+        except psycopg2.InterfaceError as e:
+            # Handle connection already closed errors
+            error_msg = f"Database interface error (connection closed): {e}"
+            logging.error(error_msg)
             self.connect_with_retries()
             return (False, error_msg) if return_error_msg else False
         except psycopg2.errors.NumericValueOutOfRange as e:
