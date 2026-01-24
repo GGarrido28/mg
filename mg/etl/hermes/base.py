@@ -58,6 +58,11 @@ class Cartographer(ABC):
         self.logger = logger
         self.debug = debug
 
+        # Validate class-level SQL identifiers to prevent injection
+        PostgresManager.validate_identifier(self.SOURCE_MAP_TABLE, "SOURCE_MAP_TABLE")
+        PostgresManager.validate_identifier(self.ENTITY_TABLE, "ENTITY_TABLE")
+        PostgresManager.validate_identifier(self.ENTITY_ID_COLUMN, "ENTITY_ID_COLUMN")
+
         self.pgm = PostgresManager(
             host="digital_ocean",
             database=self.db_name,

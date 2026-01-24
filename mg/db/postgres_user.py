@@ -37,7 +37,8 @@ def validate_identifier(name: str, identifier_type: str = "identifier") -> str:
             "and contain only alphanumeric characters and underscores"
         )
 
-    sql_keywords = {'select', 'insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create'}
+    # Note: 'source' is included as it's a reserved word in some SQL contexts
+    sql_keywords = {'select', 'insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'source'}
     if name.lower() in sql_keywords:
         raise ValueError(f"Invalid {identifier_type} '{name}': cannot use SQL keyword as identifier")
 

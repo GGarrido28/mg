@@ -94,6 +94,9 @@ class GameCartographer(Cartographer):
         # Parse and normalize time
         if isinstance(start_time, str):
             game_dt = convert_str_to_datetime(start_time)
+            if game_dt is None:
+                self._log(f"Failed to parse start_time: {start_time}", level="warning")
+                return None
         else:
             game_dt = start_time
 
@@ -429,6 +432,8 @@ class GameCartographer(Cartographer):
         if start_time:
             if isinstance(start_time, str):
                 start_time_dt = convert_str_to_datetime(start_time)
+                if start_time_dt is None:
+                    self._log(f"Failed to parse start_time: {start_time}", level="warning")
             else:
                 start_time_dt = start_time
 
@@ -437,6 +442,8 @@ class GameCartographer(Cartographer):
         if game_date:
             if isinstance(game_date, str):
                 game_date_parsed = convert_str_to_date(game_date)
+                if game_date_parsed is None:
+                    self._log(f"Failed to parse game_date: {game_date}", level="warning")
             else:
                 game_date_parsed = game_date
 
