@@ -1,7 +1,8 @@
 """Player cartographer for mapping external player IDs to internal entities."""
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 import logging
+import uuid
 
 from mg.etl.hermes.base import Cartographer
 from mg.etl.lexis import (
@@ -20,7 +21,7 @@ class PlayerCartographer(Cartographer):
     """Cartographer for external player IDs to internal player entities.
 
     Matches players by:
-    1. Exact source_id lookup (cached)
+    1. Exact data_source_id lookup (cached)
     2. Exact normalized name
     3. Name + team/position filter
     4. Fuzzy name similarity (configurable threshold)
@@ -32,28 +33,31 @@ class PlayerCartographer(Cartographer):
 
     def __init__(
         self,
-        source: str,
+        data_source: str,
         db_name: str,
         schema: str = "core",
         position_mapping: Optional[dict[str, str]] = None,
         similarity_threshold: float = 0.85,
+        team_cartographer: Optional[Any] = None,
         logger: Optional["LoggerManager"] = None,
         debug: bool = False,
     ):
         """Initialize the PlayerCartographer.
 
         Args:
-            source: Data source identifier
+            data_source: Data source identifier
             db_name: Database name
             schema: Database schema
             position_mapping: Dict mapping source positions to internal positions
             similarity_threshold: Minimum similarity score for fuzzy matching
+            team_cartographer: Optional TeamCartographer for mapping teams
             logger: Optional LoggerManager instance for structured logging
             debug: Enable debug logging
         """
         self.position_mapping = position_mapping or {}
         self.similarity_threshold = similarity_threshold
-        super().__init__(source, db_name, schema, logger, debug)
+        self.team_cartographer = team_cartographer
+        super().__init__(data_source, db_name, schema, logger, debug)
 
     def _build_indices(self) -> None:
         """Build lookup indices for efficient name matching."""
@@ -92,7 +96,7 @@ class PlayerCartographer(Cartographer):
 
     def map(
         self,
-        source_id: str,
+        data_source_id: str,
         name: Optional[str] = None,
         team: Optional[str] = None,
         team_id: Optional[str] = None,
@@ -101,7 +105,7 @@ class PlayerCartographer(Cartographer):
         """Map a player by source ID or name/team/position.
 
         Args:
-            source_id: External source identifier (required)
+            data_source_id: External source identifier (required)
             name: Player name
             team: Team name/abbreviation
             team_id: Internal team ID (from TeamCartographer)
@@ -110,18 +114,18 @@ class PlayerCartographer(Cartographer):
         Returns:
             Matched player dict or None
         """
-        # Normalize source_id to string
-        source_id = str(source_id)
+        # Normalize data_source_id to string
+        data_source_id = str(data_source_id)
 
         # Step 1: Check cache
-        if source_id:
-            cached = self._lookup_cached(source_id)
+        if data_source_id:
+            cached = self._lookup_cached(data_source_id)
             if cached:
-                self._log(f"Cache hit: source_id={source_id}")
+                self._log(f"Cache hit: data_source_id={data_source_id}")
                 return cached
 
         if not name:
-            self._log(f"No name provided for source_id={source_id}")
+            self._log(f"No name provided for data_source_id={data_source_id}")
             return None
 
         # Normalize inputs
@@ -134,7 +138,7 @@ class PlayerCartographer(Cartographer):
         if len(exact_matches) == 1:
             player = exact_matches[0]
             log_info = {"method": "exact_name", "input_name": name}
-            self._add_mapping(source_id, player, confidence_rating=100, log_info=log_info)
+            self._add_mapping(data_source_id, player, confidence_rating=100, log_info=log_info)
             self._log(f"Exact name match: {name}")
             return player
 
@@ -151,7 +155,7 @@ class PlayerCartographer(Cartographer):
                     "team_id": team_id,
                     "position": position,
                 }
-                self._add_mapping(source_id, player, confidence_rating=95, log_info=log_info)
+                self._add_mapping(data_source_id, player, confidence_rating=95, log_info=log_info)
                 self._log(f"Exact name + filter: {name}")
                 return player
 
@@ -193,14 +197,14 @@ class PlayerCartographer(Cartographer):
                         "input_name": name,
                         "similarity": round(best_similarity, 3),
                     }
-                    self._add_mapping(source_id, best_match, confidence_rating=confidence_rating, log_info=log_info)
+                    self._add_mapping(data_source_id, best_match, confidence_rating=confidence_rating, log_info=log_info)
                     self._log(f"Fuzzy match: {name} (confidence={confidence_rating})")
                     return best_match
 
         # No match found
         self._log(
-            f"Cannot map player: source={self.source}, "
-            f"source_id={source_id}, name={name}, team={team}",
+            f"Cannot map player: data_source={self.data_source}, "
+            f"data_source_id={data_source_id}, name={name}, team={team}",
             level="warning",
         )
         return None
@@ -240,3 +244,76 @@ class PlayerCartographer(Cartographer):
                 return pos_matches[0]
 
         return None
+
+    def get_or_create(
+        self,
+        data_source_id: str,
+        player_name: Optional[str] = None,
+        team_id: Optional[str] = None,
+        team_name: Optional[str] = None,
+        position: Optional[str] = None,
+        **kwargs,
+    ) -> dict:
+        """Get existing player or create a new one.
+
+        Args:
+            data_source_id: External source identifier (required)
+            player_name: Player name/gamertag
+            team_id: Internal team ID (from TeamCartographer)
+            team_name: Internal team name/abbreviation
+            position: Player position/role
+            **kwargs: Additional player fields (data_source_team_id, source_team, rating, etc.)
+
+        Returns:
+            Player dict with ID (existing or newly created)
+        """
+        data_source_id = str(data_source_id)
+
+        # Try to find existing player
+        existing = self.map(
+            data_source_id=data_source_id,
+            name=player_name,
+            team=team_name,
+            team_id=team_id,
+            position=position,
+        )
+
+        if existing:
+            player_id = existing["id"]
+            self._log(f"Found existing player: {data_source_id} -> {player_id}")
+        else:
+            player_id = uuid.uuid4()
+            self._log(f"Creating new player: {data_source_id} -> {player_id}")
+
+        # Fields to exclude from clean entity table (stored in source_map instead)
+        source_fields = {"data_source_team_id", "source_team"}
+
+        # Build player entity (clean, without source-specific fields)
+        player = {
+            "id": player_id,
+            "player_name": player_name.strip() if player_name else None,
+            "team_id": team_id,
+            "team_name": team_name.strip() if team_name else None,
+            "position": position,
+            **{k: v for k, v in kwargs.items() if k not in source_fields},
+            "data_source": self.data_source,
+        }
+
+        # Remove None values
+        player = {k: v for k, v in player.items() if v is not None}
+
+        # Add to cache and pending entities
+        self.cache[data_source_id] = player
+        self._pending_entities.append(player)
+
+        # Add mapping to pending (for source_map table)
+        if not existing:
+            log_info = {
+                "method": "get_or_create",
+                "player_name": player_name,
+                "data_source_team_id": kwargs.get("data_source_team_id"),
+                "source_team": kwargs.get("source_team"),
+            }
+            self._add_mapping(data_source_id, player, confidence_rating=100, log_info=log_info)
+
+        return player

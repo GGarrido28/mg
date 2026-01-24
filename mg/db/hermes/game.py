@@ -18,19 +18,23 @@ class SourceGame(SourceEntity):
     # Team IDs
     away_team_id: Optional[str] = None
     home_team_id: Optional[str] = None
-    source_away_team_id: Optional[str] = None  # Team IDs from source
-    source_home_team_id: Optional[str] = None  # Team IDs from source
+    data_source_away_team_id: Optional[str] = None  # Team IDs from source
+    data_source_home_team_id: Optional[str] = None  # Team IDs from source
 
     # Teams
     away_team: Optional[str] = None
     home_team: Optional[str] = None
-    source_away_team: Optional[str] = None  # Team names from source
-    source_home_team: Optional[str] = None  # Team names from source
+    data_source_away_team: Optional[str] = None  # Team names from source
+    data_source_home_team: Optional[str] = None  # Team names from source
 
-    # Timing
-    start_time: Optional[datetime] = None  # Full datetime
-    game_date: Optional[date] = None  # Just the date
+    # Timing (local/source timezone)
+    start_time: Optional[datetime] = None  # Full datetime in source timezone
+    game_date: Optional[date] = None  # Just the date in source timezone
     timezone: Optional[str] = None  # Source timezone (e.g., "UTC", "EST")
+
+    # Timing (UTC)
+    start_time_utc: Optional[datetime] = None  # Full datetime in UTC
+    game_date_utc: Optional[date] = None  # Just the date in UTC
 
     # Status
     status: Optional[str] = None  # "scheduled", "in_progress", "final", etc.

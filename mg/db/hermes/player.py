@@ -27,7 +27,7 @@ class SourcePlayer(SourceEntity):
     team: Optional[str] = None  # Universal team name/abbreviation
     team_id: Optional[str] = None  # Universal team ID
     source_team: Optional[str] = None  # Team name/abbreviation from source
-    source_team_id: Optional[str] = None  # Team ID from source
+    data_source_team_id: Optional[str] = None  # Team ID from source
     
     # League info
     league: Optional[str] = None  # League identifier (e.g., "NFL", "NBA")
