@@ -1,7 +1,8 @@
 """Team cartographer for mapping external team IDs to internal entities."""
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 import logging
+import uuid
 
 from mg.etl.hermes.base import Cartographer
 from mg.etl.lexis import strip_convert_to_lowercase, name_similarity
@@ -16,7 +17,7 @@ class TeamCartographer(Cartographer):
     """Cartographer for external team IDs to internal team entities.
 
     Matches teams by:
-    1. Exact source_id lookup (cached)
+    1. Exact data_source_id lookup (cached)
     2. Exact normalized full name (confidence: 100)
     3. Abbreviation match (confidence: 95)
     4. Location match (confidence: 90)
@@ -31,7 +32,7 @@ class TeamCartographer(Cartographer):
 
     def __init__(
         self,
-        source: str,
+        data_source: str,
         db_name: str,
         schema: str = "core",
         team_mapping: Optional[dict[str, str]] = None,
@@ -43,7 +44,7 @@ class TeamCartographer(Cartographer):
         """Initialize the TeamCartographer.
 
         Args:
-            source: Data source identifier
+            data_source: Data source identifier
             db_name: Database name
             schema: Database schema
             team_mapping: Dict mapping source team names to internal names
@@ -55,7 +56,7 @@ class TeamCartographer(Cartographer):
         self.team_mapping = team_mapping or {}
         self.name_column = name_column
         self.similarity_threshold = similarity_threshold
-        super().__init__(source, db_name, schema, logger, debug)
+        super().__init__(data_source, db_name, schema, logger, debug)
 
     def _normalize_team(self, name: str) -> str:
         """Normalize a team name using the team_mapping."""
@@ -100,30 +101,30 @@ class TeamCartographer(Cartographer):
 
     def map(
         self,
-        source_id: str,
+        data_source_id: str,
         name: Optional[str] = None,
     ) -> Optional[dict]:
         """Map a team by source ID or name.
 
         Args:
-            source_id: External source identifier (required)
+            data_source_id: External source identifier (required)
             name: Team name (full name, location, or mascot)
 
         Returns:
             Matched team dict or None
         """
-        # Normalize source_id to string
-        source_id = str(source_id)
+        # Normalize data_source_id to string
+        data_source_id = str(data_source_id)
 
         # Check cache
-        if source_id:
-            cached = self._lookup_cached(source_id)
+        if data_source_id:
+            cached = self._lookup_cached(data_source_id)
             if cached:
-                self._log(f"Cache hit: source_id={source_id}")
+                self._log(f"Cache hit: data_source_id={data_source_id}")
                 return cached
 
         if not name:
-            self._log(f"No name provided for source_id={source_id}")
+            self._log(f"No name provided for data_source_id={data_source_id}")
             return None
 
         # Apply team mapping
@@ -134,7 +135,7 @@ class TeamCartographer(Cartographer):
         team = self._by_normalized_name.get(normalized)
         if team:
             log_info = {"method": "exact_name", "input_name": name}
-            self._add_mapping(source_id, team, confidence_rating=100, log_info=log_info)
+            self._add_mapping(data_source_id, team, confidence_rating=100, log_info=log_info)
             self._log(f"Exact name match: {name}")
             return team
 
@@ -142,7 +143,7 @@ class TeamCartographer(Cartographer):
         team = self._by_abbreviation.get(normalized)
         if team:
             log_info = {"method": "abbreviation", "input_name": name}
-            self._add_mapping(source_id, team, confidence_rating=95, log_info=log_info)
+            self._add_mapping(data_source_id, team, confidence_rating=95, log_info=log_info)
             self._log(f"Abbreviation match: {name}")
             return team
 
@@ -150,7 +151,7 @@ class TeamCartographer(Cartographer):
         team = self._by_location.get(normalized)
         if team:
             log_info = {"method": "location", "input_name": name}
-            self._add_mapping(source_id, team, confidence_rating=90, log_info=log_info)
+            self._add_mapping(data_source_id, team, confidence_rating=90, log_info=log_info)
             self._log(f"Location match: {name}")
             return team
 
@@ -158,7 +159,7 @@ class TeamCartographer(Cartographer):
         team = self._by_mascot.get(normalized)
         if team:
             log_info = {"method": "mascot", "input_name": name}
-            self._add_mapping(source_id, team, confidence_rating=85, log_info=log_info)
+            self._add_mapping(data_source_id, team, confidence_rating=85, log_info=log_info)
             self._log(f"Mascot match: {name}")
             return team
 
@@ -166,7 +167,7 @@ class TeamCartographer(Cartographer):
         team = self._match_by_tokens(mapped_name)
         if team:
             log_info = {"method": "token_overlap", "input_name": name}
-            self._add_mapping(source_id, team, confidence_rating=80, log_info=log_info)
+            self._add_mapping(data_source_id, team, confidence_rating=80, log_info=log_info)
             self._log(f"Token overlap match: {name}")
             return team
 
@@ -179,14 +180,14 @@ class TeamCartographer(Cartographer):
                 "input_name": name,
                 "similarity": round(similarity, 3),
             }
-            self._add_mapping(source_id, team, confidence_rating=confidence_rating, log_info=log_info)
+            self._add_mapping(data_source_id, team, confidence_rating=confidence_rating, log_info=log_info)
             self._log(f"Fuzzy match: {name} (confidence={confidence_rating})")
             return team
 
         # No match found
         self._log(
-            f"Cannot map team: source={self.source}, "
-            f"source_id={source_id}, name={name}",
+            f"Cannot map team: data_source={self.data_source}, "
+            f"data_source_id={data_source_id}, name={name}",
             level="warning",
         )
         return None
@@ -226,3 +227,81 @@ class TeamCartographer(Cartographer):
                     best_match = team
 
         return best_match, best_similarity
+
+    def get_or_create(
+        self,
+        data_source_id: str,
+        team_name: Optional[str] = None,
+        abbreviation: Optional[str] = None,
+        location: Optional[str] = None,
+        mascot: Optional[str] = None,
+        league: Optional[str] = None,
+        division: Optional[str] = None,
+        conference: Optional[str] = None,
+        logo_url: Optional[str] = None,
+        primary_color: Optional[str] = None,
+        secondary_color: Optional[str] = None,
+        is_active: bool = True,
+    ) -> dict:
+        """Get existing team or create a new one.
+
+        Args:
+            data_source_id: External source identifier (required)
+            team_name: Full team name
+            abbreviation: Short code (e.g., "DAL")
+            location: City/state
+            mascot: Team mascot
+            league: League identifier
+            division: Division name
+            conference: Conference name
+            logo_url: Team logo URL
+            primary_color: Primary team color
+            secondary_color: Secondary team color
+            is_active: Whether team is active
+
+        Returns:
+            Team dict with ID (existing or newly created)
+        """
+        data_source_id = str(data_source_id)
+
+        # Try to find existing team
+        existing = self.map(data_source_id=data_source_id, name=team_name)
+
+        if existing:
+            team_id = existing["id"]
+            self._log(f"Found existing team: {data_source_id} -> {team_id}")
+        else:
+            team_id = uuid.uuid4()
+            self._log(f"Creating new team: {data_source_id} -> {team_id}")
+
+        # Build team entity with all fields (None values excluded on insert)
+        team = {
+            "id": team_id,
+            "data_source_id": data_source_id,
+            "team_name": team_name.strip() if team_name else None,
+            "abbreviation": abbreviation.strip().upper() if abbreviation else None,
+            "location": location.strip() if location else None,
+            "mascot": mascot.strip() if mascot else None,
+            "league": league,
+            "division": division,
+            "conference": conference,
+            "logo_url": logo_url,
+            "primary_color": primary_color,
+            "secondary_color": secondary_color,
+            "is_active": is_active,
+            "data_source": self.data_source,
+        }
+
+        # Remove None values
+        team = {k: v for k, v in team.items() if v is not None}
+
+        # Add to cache and pending entities
+        self.cache[data_source_id] = team
+        self._pending_entities.append(team)
+
+        # Add mapping to pending (for source_map table)
+        if not existing:
+            log_info = {"method": "get_or_create", "team_name": team_name}
+            self._add_mapping(data_source_id, team, confidence_rating=100, log_info=log_info)
+
+        return team

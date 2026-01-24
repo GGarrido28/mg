@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from datetime import datetime
 import json
 import logging
+import uuid
 
 from mg.db.postgres_manager import PostgresManager
 
@@ -21,7 +22,7 @@ class Cartographer(ABC):
     external data source identifiers and internal master entity IDs.
 
     Attributes:
-        source: The data source identifier (e.g., "draftkings", "fanduel")
+        data_source: The data source identifier (e.g., "draftkings", "fanduel")
         db_name: The database name to connect to
         schema: The database schema (default: "core")
         pgm: PostgresManager instance for database operations
@@ -36,7 +37,7 @@ class Cartographer(ABC):
 
     def __init__(
         self,
-        source: str,
+        data_source: str,
         db_name: str,
         schema: str = "core",
         logger: Optional["LoggerManager"] = None,
@@ -45,17 +46,22 @@ class Cartographer(ABC):
         """Initialize the mapper.
 
         Args:
-            source: Data source identifier (e.g., "draftkings", "fanduel")
+            data_source: Data source identifier (e.g., "draftkings", "fanduel")
             db_name: Database name (e.g., "nfl", "nba")
             schema: Database schema (default: "core")
             logger: Optional LoggerManager instance for structured logging
-            debug: Enable debug logging
+            debug: Enable debug logging (also enables verbose SQL logging)
         """
-        self.source = source
+        self.data_source = data_source
         self.db_name = db_name
         self.schema = schema
         self.logger = logger
         self.debug = debug
+
+        # Validate class-level SQL identifiers to prevent injection
+        PostgresManager.validate_identifier(self.SOURCE_MAP_TABLE, "SOURCE_MAP_TABLE")
+        PostgresManager.validate_identifier(self.ENTITY_TABLE, "ENTITY_TABLE")
+        PostgresManager.validate_identifier(self.ENTITY_ID_COLUMN, "ENTITY_ID_COLUMN")
 
         self.pgm = PostgresManager(
             host="digital_ocean",
@@ -63,7 +69,7 @@ class Cartographer(ABC):
             schema=self.schema,
         )
 
-        # In-memory cache: source_id -> entity dict
+        # In-memory cache: data_source_id -> entity dict
         self.cache: dict[str, dict] = {}
 
         # Entities available for matching (not yet mapped)
@@ -72,6 +78,9 @@ class Cartographer(ABC):
         # Pending mappings to save
         self._pending: list[dict] = []
 
+        # Pending entities to insert
+        self._pending_entities: list[dict] = []
+
         # Load existing mappings and entities
         self._load_cache()
         self._load_entities()
@@ -79,25 +88,27 @@ class Cartographer(ABC):
     def _load_cache(self) -> None:
         """Load existing mappings from the map table into cache."""
         query = f"""
-            SELECT m.source_id, m.entity_id, m.log_info, e.*
-            FROM {self.SOURCE_MAP_TABLE} m
-            JOIN {self.ENTITY_TABLE} e ON m.entity_id = e.{self.ENTITY_ID_COLUMN}
-            WHERE m.source = '{self.source}'
+            SELECT m.data_source_id, m.entity_id, m.log_info, e.*
+            FROM {self.schema}.{self.SOURCE_MAP_TABLE} m
+            JOIN {self.schema}.{self.ENTITY_TABLE} e ON m.entity_id = e.{self.ENTITY_ID_COLUMN}
+            WHERE m.data_source = %(data_source)s
         """
-        rows = self.pgm.execute(query)
+        rows = self.pgm.execute(query, params={"data_source": self.data_source})
+        if self.debug:
+            logging.info(f"[{self.__class__.__name__}] Loaded {len(rows)} cached mappings for data_source='{self.data_source}'")
         for row in rows:
-            self.cache[str(row["source_id"])] = row
+            self.cache[str(row["data_source_id"])] = row
 
     def _load_entities(self) -> None:
-        """Load entities not already mapped for this source."""
+        """Load entities not already mapped for this data_source."""
         query = f"""
-            SELECT * FROM {self.ENTITY_TABLE}
+            SELECT * FROM {self.schema}.{self.ENTITY_TABLE}
             WHERE {self.ENTITY_ID_COLUMN} NOT IN (
-                SELECT entity_id FROM {self.SOURCE_MAP_TABLE}
-                WHERE source = '{self.source}'
+                SELECT entity_id FROM {self.schema}.{self.SOURCE_MAP_TABLE}
+                WHERE data_source = %(data_source)s
             )
         """
-        self.entities = self.pgm.execute(query)
+        self.entities = self.pgm.execute(query, params={"data_source": self.data_source})
         self._build_indices()
 
     def _build_indices(self) -> None:
@@ -108,11 +119,11 @@ class Cartographer(ABC):
         pass
 
     @abstractmethod
-    def map(self, source_id: Optional[str] = None, **kwargs) -> Optional[dict]:
+    def map(self, data_source_id: Optional[str] = None, **kwargs) -> Optional[dict]:
         """Map a source identifier to an internal entity.
 
         Args:
-            source_id: The external source identifier
+            data_source_id: The external source identifier
             **kwargs: Additional matching criteria (name, team, etc.)
 
         Returns:
@@ -120,20 +131,48 @@ class Cartographer(ABC):
         """
         pass
 
-    def _lookup_cached(self, source_id: str) -> Optional[dict]:
-        """Look up a source_id in the cache.
+    @abstractmethod
+    def get_or_create(self, data_source_id: str, **kwargs) -> dict:
+        """Get existing entity or create a new one.
+
+        Subclasses should:
+        1. Call map() to check for existing entity
+        2. If found, use existing ID
+        3. If not found, generate new UUID
+        4. Build entity dict with standard fields
+        5. Add to _pending_entities for later insertion
 
         Args:
-            source_id: The source identifier to look up
+            data_source_id: The external source identifier
+            **kwargs: Entity-specific fields
+
+        Returns:
+            Entity dict with ID (existing or newly created)
+        """
+        pass
+
+    def get_pending_entities(self) -> list[dict]:
+        """Get list of new entities to insert."""
+        return self._pending_entities
+
+    def clear_pending_entities(self) -> None:
+        """Clear the pending entities list after insertion."""
+        self._pending_entities = []
+
+    def _lookup_cached(self, data_source_id: str) -> Optional[dict]:
+        """Look up a data_source_id in the cache.
+
+        Args:
+            data_source_id: The source identifier to look up
 
         Returns:
             Cached entity dict or None
         """
-        return self.cache.get(str(source_id))
+        return self.cache.get(str(data_source_id))
 
     def _add_mapping(
         self,
-        source_id: str,
+        data_source_id: str,
         entity: dict,
         confidence_rating: int = 100,
         log_info: Optional[dict] = None,
@@ -141,19 +180,17 @@ class Cartographer(ABC):
         """Add a new mapping to cache and pending list.
 
         Args:
-            source_id: The external source identifier
+            data_source_id: The external source identifier
             entity: The matched entity dict
-            confidence_rating: Confidence confidence_rating 0-100 (100 = exact match)
+            confidence_rating: Confidence rating 0-100 (100 = exact match)
             log_info: Information about how the match was made
         """
-        source_id = str(source_id)
-        entity["log_info"] = log_info or {}
-        entity["confidence_rating"] = confidence_rating
-        self.cache[source_id] = entity
+        data_source_id = str(data_source_id)
+        self.cache[data_source_id] = entity
 
         self._pending.append({
-            "source": self.source,
-            "source_id": source_id,
+            "data_source": self.data_source,
+            "data_source_id": data_source_id,
             "entity_id": entity[self.ENTITY_ID_COLUMN],
             "confidence_rating": confidence_rating,
             "log_info": json.dumps(log_info or {}),
@@ -168,15 +205,30 @@ class Cartographer(ABC):
         if not self._pending:
             return True
 
+        # Ensure the source_map table exists with proper primary key
+        if not self.pgm.check_table_exists(self.SOURCE_MAP_TABLE):
+            if self.debug:
+                logging.info(f"[{self.__class__.__name__}] Creating source_map table: {self.SOURCE_MAP_TABLE}")
+            self.pgm.create_table(
+                dict_list=self._pending,
+                primary_keys=["data_source", "data_source_id"],
+                table_name=self.SOURCE_MAP_TABLE,
+                delete=False,
+            )
+
         result = self.pgm.insert_rows(
             self.SOURCE_MAP_TABLE,
-            ["source", "source_id", "entity_id", "confidence_rating", "log_info"],
+            ["data_source", "data_source_id", "entity_id", "confidence_rating", "log_info"],
             self._pending,
             contains_dicts=True,
             update=True,
         )
         if result:
+            if self.debug:
+                logging.info(f"[{self.__class__.__name__}] Saved {len(self._pending)} mappings to {self.SOURCE_MAP_TABLE}")
             self._pending = []
+        else:
+            logging.error(f"[{self.__class__.__name__}] Failed to save mappings to {self.SOURCE_MAP_TABLE}")
         return result
 
     def _log(self, message: str, level: str = "debug") -> None:

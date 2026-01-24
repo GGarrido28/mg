@@ -1,14 +1,20 @@
-import os
 import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import register_uuid
 import logging
 import json
+import re
 from datetime import datetime, date, time
+from uuid import UUID
 import socket
 from time import sleep
 
 from mg.db.config import POSTGRES_HOSTS
 
 logging.basicConfig(level=logging.INFO)
+
+# Register UUID adapter so psycopg2 can handle Python UUID objects
+register_uuid()
 
 
 class PostgresManager:
@@ -31,6 +37,40 @@ class PostgresManager:
                 return default
             current = current[key]
         return current
+
+    @staticmethod
+    def validate_identifier(name, identifier_type="identifier"):
+        """
+        Validate that a string is safe to use as a SQL identifier.
+
+        Args:
+            name (str): The identifier to validate
+            identifier_type (str): Type of identifier for error messages (e.g., "table", "column")
+
+        Returns:
+            str: The validated identifier
+
+        Raises:
+            ValueError: If the identifier contains invalid characters
+        """
+        if not name or not isinstance(name, str):
+            raise ValueError(f"Invalid {identifier_type}: must be a non-empty string")
+
+        # Allow alphanumeric, underscores, and dots (for schema.table notation)
+        # PostgreSQL identifiers can also start with underscore or letter
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+            raise ValueError(
+                f"Invalid {identifier_type} '{name}': must start with letter or underscore, "
+                "and contain only alphanumeric characters and underscores"
+            )
+
+        # Check for SQL keywords that could be problematic (basic check)
+        # Note: 'source' is included as it's a reserved word in some SQL contexts
+        sql_keywords = {'select', 'insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'source'}
+        if name.lower() in sql_keywords:
+            raise ValueError(f"Invalid {identifier_type} '{name}': cannot use SQL keyword as identifier")
+
+        return name
 
     @staticmethod
     def verify_config_exists(host, database, schema):
@@ -99,6 +139,10 @@ class PostgresManager:
         self.port = schema_config.get("port")
         self.return_logging = return_logging
 
+        # Validate database and schema names to prevent injection in search_path
+        self.validate_identifier(self.database, "database")
+        self.validate_identifier(self.schema, "schema")
+
         # Validate essential connection parameters
         for param_name, param_value in [
             ("host", self.host),
@@ -138,6 +182,9 @@ class PostgresManager:
                 "Basic network connectivity successful, attempting database connection"
             )
         self.connect_with_retries()
+        # Default to autocommit=True for simple queries (execute(), check_table_exists(), etc.)
+        # Methods that need transactions (insert_rows) temporarily disable autocommit
+        # and restore it when done via _get_and_set_autocommit() / _set_autocommit_safely()
         self.connection.set_session(autocommit=True)
 
         # Add logging to debug connection parameters
@@ -221,18 +268,21 @@ class PostgresManager:
             cursor.close()
 
     def get_table_primary_key(self, table):
+        # Validate table name
+        self.validate_identifier(table, "table")
+
         cursor = self.get_cursor()
-        q = f"""
+        q = """
             SELECT column_name
             FROM information_schema.table_constraints
             JOIN information_schema.key_column_usage
                     USING (constraint_catalog, constraint_schema, constraint_name,
                             table_catalog, table_schema, table_name)
             WHERE constraint_type = 'PRIMARY KEY'
-            AND (table_schema, table_name) = ('{self.schema}', '{table}')
+            AND (table_schema, table_name) = (%s, %s)
             ORDER BY ordinal_position;"""
         try:
-            cursor.execute(q)
+            cursor.execute(q, (self.schema, table))
             result = cursor.fetchall()
             results = [row[0] for row in result]
 
@@ -240,20 +290,20 @@ class PostgresManager:
                 return results
 
             # Check if table exists and user has access via pg_catalog (more reliable)
-            cursor.execute(f"""
+            cursor.execute("""
                 SELECT EXISTS (
                     SELECT 1 FROM pg_catalog.pg_class c
                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = '{self.schema}' AND c.relname = '{table}'
-                );""")
+                    WHERE n.nspname = %s AND c.relname = %s
+                );""", (self.schema, table))
             table_exists_pg = cursor.fetchone()[0]
 
             # Check if table is visible in information_schema (permission-dependent)
-            cursor.execute(f"""
+            cursor.execute("""
                 SELECT EXISTS (
                     SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = '{self.schema}' AND table_name = '{table}'
-                );""")
+                    WHERE table_schema = %s AND table_name = %s
+                );""", (self.schema, table))
             table_visible_info_schema = cursor.fetchone()[0]
 
             if not table_exists_pg:
@@ -283,6 +333,7 @@ class PostgresManager:
             date: "DATE",
             time: "TIME",
             bytes: "BYTEA",
+            UUID: "UUID",
         }
 
         non_none_values = [value for value in values if value is not None]
@@ -333,6 +384,8 @@ class PostgresManager:
                     filtered_row[key] = json.dumps(value)
                 elif isinstance(value, (datetime, date)):
                     filtered_row[key] = value.isoformat()
+                elif isinstance(value, UUID):
+                    filtered_row[key] = str(value)
 
             # Generate a unique key for the row based on its contents
             row_key = json.dumps(filtered_row, sort_keys=True)
@@ -372,14 +425,14 @@ class PostgresManager:
     def insert_rows(
         self, target_table, columns, rows, contains_dicts=False, update=False, return_error_msg=False
     ):
-        """Insert rows into a table.
+        """Insert rows into a table using parameterized queries.
 
         Args:
             target_table (str): Table to insert rows into.
             columns (list): List of column names.
-            rows (list): List of rows to insert.
+            rows (list): List of rows to insert (list of dicts if contains_dicts=True).
             contains_dicts (bool): Whether the rows contain dictionaries.
-            update (bool): Whether to update existing rows.
+            update (bool): Whether to update existing rows (upsert).
             return_error_msg (bool): If True, return tuple (success, error_msg). If False, return only bool for backward compatibility.
 
         Returns:
@@ -392,6 +445,10 @@ class PostgresManager:
         """
         # Initialize variables outside the try block
         old_autocommit = None
+        query_str = None  # For error reporting
+
+        # Validate table name
+        self.validate_identifier(target_table, "table")
 
         try:
             # Safely get and modify the connection state
@@ -434,80 +491,93 @@ class PostgresManager:
 
                     columns = list(columns)
                     columns = self.get_all_columns(rows, columns)
-                    q = f"INSERT INTO {target_table} ("
+
+                    # Validate all column names
                     for col in columns:
-                        q += f'"{col.lower()}", '
-                    q = q[:-2]
-                    q += ") VALUES "
+                        self.validate_identifier(col, "column")
 
+                    # Build column identifiers safely using psycopg2.sql
+                    col_identifiers = [sql.Identifier(col.lower()) for col in columns]
+
+                    # Prepare row values for parameterized insertion
+                    prepared_rows = []
                     if contains_dicts:
-                        new_rows = []
                         for row in rows:
-                            new_row = ()
+                            prepared_row = []
                             for col in columns:
-                                s = row.get(col)
-                                if isinstance(s, dict) or isinstance(s, list):
-                                    s = json.dumps(s)
-                                if "'" in str(s):
-                                    s = str(s).replace("'", "''")
-                                if "" == str(s):
-                                    s = None
-                                new_row = new_row + (s,)
-                            new_rows.append(new_row)
-                        rows = new_rows
-                        params = ""
-                        for row in rows:
-                            record = ""
-                            for data in row:
-                                if data is None:
-                                    record += "NULL, "
-                                else:
-                                    record += "'" + str(data) + "', "
-                            record = record[:-2]
-                            params += "(" + record + "), "
-                        params = params[:-2]
-                        q += params
+                                value = row.get(col)
+                                if isinstance(value, (dict, list)):
+                                    value = json.dumps(value)
+                                elif value == "":
+                                    value = None
+                                prepared_row.append(value)
+                            prepared_rows.append(tuple(prepared_row))
                     else:
-                        record = ""
-                        for data in rows:
-                            record += "'" + str(rows.get(data)) + "', "
-                        record = record[:-2]
-                        q += "(" + record + ")"
+                        # Handle single dict case (legacy behavior)
+                        if isinstance(rows, dict):
+                            prepared_row = [rows.get(col) for col in columns]
+                            prepared_rows.append(tuple(prepared_row))
+                        else:
+                            prepared_rows = [tuple(row) if isinstance(row, (list, tuple)) else (row,) for row in rows]
 
+                    # Build the INSERT query using psycopg2.sql
+                    # Create placeholders for each row
+                    placeholders = sql.SQL(", ").join([sql.Placeholder()] * len(columns))
+                    values_template = sql.SQL("({})").format(placeholders)
+
+                    # Build full query
+                    base_query = sql.SQL("INSERT INTO {schema}.{table} ({columns}) VALUES ").format(
+                        schema=sql.Identifier(self.schema),
+                        table=sql.Identifier(target_table),
+                        columns=sql.SQL(", ").join(col_identifiers)
+                    )
+
+                    # Build ON CONFLICT clause if update=True
+                    conflict_clause = sql.SQL("")
                     if update:
                         if pk is None:
                             error_msg = f"Cannot perform upsert on table {target_table} - no primary key defined"
                             logging.error(error_msg)
                             return (False, error_msg) if return_error_msg else False
-                        elif len(pk) == 1 and len(columns) == 1:
-                            q += f" ON CONFLICT ({pk[0]}) DO UPDATE SET {columns[0]} = EXCLUDED.{columns[0]}"
-                        elif len(pk) > 1:
-                            # Handle multiple primary keys
-                            pk_str = ", ".join(f'"{p}"' for p in pk)
-                            set_q = ", ".join(
-                                [
-                                    f'"{col.lower()}" = EXCLUDED."{col.lower()}"'
-                                    for col in columns
-                                    if col not in pk
-                                ]
-                            )
-                            q += f" ON CONFLICT ({pk_str}) DO UPDATE SET {set_q}"
-                        else:
-                            set_q = "ROW ("
-                            q += f" ON CONFLICT ({', '.join(pk)}) DO UPDATE SET ("
-                            for col in columns:
-                                if col in pk:
-                                    continue
-                                q += f'"{col.lower()}", '
-                                set_q += f"EXCLUDED.{col.lower()}, "
-                            set_q = set_q[:-2]
-                            set_q += ")"
-                            q = q[:-2]
-                            q += f") = {set_q}"
 
-                    if self.return_logging:
-                        logging.info(q)
-                    cursor.execute(q)
+                        # Validate primary key columns
+                        for p in pk:
+                            self.validate_identifier(p, "primary key column")
+
+                        pk_identifiers = [sql.Identifier(p) for p in pk]
+                        update_cols = [col for col in columns if col not in pk]
+
+                        if update_cols:
+                            set_clause = sql.SQL(", ").join([
+                                sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(col.lower()))
+                                for col in update_cols
+                            ])
+                            conflict_clause = sql.SQL(" ON CONFLICT ({pk}) DO UPDATE SET {set_clause}").format(
+                                pk=sql.SQL(", ").join(pk_identifiers),
+                                set_clause=set_clause
+                            )
+                        else:
+                            # All columns are primary keys, just do nothing on conflict
+                            conflict_clause = sql.SQL(" ON CONFLICT ({pk}) DO NOTHING").format(
+                                pk=sql.SQL(", ").join(pk_identifiers)
+                            )
+
+                    # Execute with executemany for multiple rows
+                    if len(prepared_rows) == 1:
+                        full_query = base_query + values_template + conflict_clause
+                        query_str = full_query.as_string(self.connection)
+                        if self.return_logging:
+                            logging.info(query_str)
+                        cursor.execute(full_query, prepared_rows[0])
+                    else:
+                        # For multiple rows, use executemany or build a multi-value insert
+                        # executemany is simpler and safer
+                        full_query = base_query + values_template + conflict_clause
+                        query_str = full_query.as_string(self.connection)
+                        if self.return_logging:
+                            logging.info(f"{query_str} (executemany with {len(prepared_rows)} rows)")
+                        cursor.executemany(full_query, prepared_rows)
+
                     logging.info(f"Rows inserted successfully into {target_table}")
             return (True, None) if return_error_msg else True
         except psycopg2.errors.UniqueViolation as e:
@@ -546,32 +616,32 @@ class PostgresManager:
             return (False, error_msg) if return_error_msg else False
         except psycopg2.errors.NumericValueOutOfRange as e:
             # Handle numeric overflow/underflow errors (e.g., value too large for smallint)
-            error_msg = self._format_sql_error("SQL Data Type Error (Numeric Out of Range)", e, q if 'q' in locals() else None)
+            error_msg = self._format_sql_error("SQL Data Type Error (Numeric Out of Range)", e, query_str)
             logging.error(error_msg)
             return (False, error_msg) if return_error_msg else False
         except psycopg2.errors.StringDataRightTruncation as e:
             # Handle string too long for column
-            error_msg = self._format_sql_error("SQL Data Type Error (String Too Long)", e, q if 'q' in locals() else None)
+            error_msg = self._format_sql_error("SQL Data Type Error (String Too Long)", e, query_str)
             logging.error(error_msg)
             return (False, error_msg) if return_error_msg else False
         except psycopg2.DataError as e:
             # Handle other data type errors
-            error_msg = self._format_sql_error("SQL Data Type Error", e, q if 'q' in locals() else None)
+            error_msg = self._format_sql_error("SQL Data Type Error", e, query_str)
             logging.error(error_msg)
             return (False, error_msg) if return_error_msg else False
         except psycopg2.IntegrityError as e:
             # Handle other integrity constraint violations not caught above
-            error_msg = self._format_sql_error("SQL Integrity Constraint Violation", e, q if 'q' in locals() else None)
+            error_msg = self._format_sql_error("SQL Integrity Constraint Violation", e, query_str)
             logging.error(error_msg)
             return (False, error_msg) if return_error_msg else False
         except psycopg2.ProgrammingError as e:
             # Handle SQL syntax or programming errors
-            error_msg = self._format_sql_error("SQL Programming Error", e, q if 'q' in locals() else None)
+            error_msg = self._format_sql_error("SQL Programming Error", e, query_str)
             logging.error(error_msg)
             return (False, error_msg) if return_error_msg else False
         except psycopg2.DatabaseError as e:
             # Handle other database-related errors
-            error_msg = self._format_sql_error("SQL Database Error", e, q if 'q' in locals() else None)
+            error_msg = self._format_sql_error("SQL Database Error", e, query_str)
             logging.error(error_msg)
             return (False, error_msg) if return_error_msg else False
         except Exception as e:
@@ -652,6 +722,40 @@ class PostgresManager:
             and not getattr(self.connection, "closed", True)
         )
 
+    def _ensure_clean_transaction_state(self):
+        """Ensure the connection is not in a failed or pending transaction state.
+
+        This method should be called after operations that may leave the connection
+        in an inconsistent state, or before operations that require changing
+        session-level settings like autocommit.
+        """
+        if not self._has_valid_connection():
+            return
+
+        try:
+            # Check if we're in a transaction
+            # status values: STATUS_READY (0), STATUS_BEGIN (1), STATUS_IN_TRANSACTION (2), STATUS_PREPARED (3)
+            # INERROR states are 4+
+            status = self.connection.get_transaction_status()
+
+            # psycopg2 transaction status constants
+            TRANSACTION_STATUS_IDLE = 0
+            TRANSACTION_STATUS_INERROR = 4
+
+            if status >= TRANSACTION_STATUS_INERROR:
+                # Connection is in an error state, need to rollback
+                self.connection.rollback()
+            elif status != TRANSACTION_STATUS_IDLE:
+                # Connection is in a transaction but not in error - commit or rollback
+                # We'll commit to preserve any pending changes
+                self.connection.commit()
+        except Exception as e:
+            logging.warning(f"Error ensuring clean transaction state: {e}")
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass  # Best effort
+
     def _get_and_set_autocommit(self, new_value):
         """Safely get the current autocommit value and set a new one.
 
@@ -670,6 +774,9 @@ class PostgresManager:
                 return None
 
         try:
+            # Ensure we're not in a transaction before changing autocommit
+            self._ensure_clean_transaction_state()
+
             # Get current value
             old_value = getattr(self.connection, "autocommit", True)
             # Set new value
@@ -687,11 +794,15 @@ class PostgresManager:
         """
         if self._has_valid_connection():
             try:
+                # Ensure we're not in a transaction before changing autocommit
+                self._ensure_clean_transaction_state()
                 self.connection.autocommit = value
             except Exception as e:
                 logging.warning(f"Error setting autocommit to {value}: {e}")
 
     def execute(self, q, params=None, raise_exc=False):
+        # Ensure clean transaction state before executing
+        self._ensure_clean_transaction_state()
         cursor = self.get_cursor()
         if self.return_logging:
             logging.info(q)
@@ -731,17 +842,20 @@ class PostgresManager:
         )
 
     def ensure_update_trigger_exists(self):
-        trigger_function_check = f"""
-        CREATE OR REPLACE FUNCTION {self.schema}.update_updated_at() RETURNS TRIGGER AS $$
+        # Use psycopg2.sql for safe schema identifier
+        trigger_function_query = sql.SQL("""
+        CREATE OR REPLACE FUNCTION {schema}.update_updated_at() RETURNS TRIGGER AS $$
         BEGIN
             NEW.updated_at = CURRENT_TIMESTAMP;
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql;
-        """
+        """).format(schema=sql.Identifier(self.schema))
         try:
-            self.execute(trigger_function_check)
+            cursor = self.get_cursor()
+            cursor.execute(trigger_function_query)
             self.connection.commit()
+            cursor.close()
             logging.info("Ensured update trigger function exists.")
         except Exception as e:
             logging.error(f"Error ensuring update trigger: {e}")
@@ -762,8 +876,16 @@ class PostgresManager:
         if primary_keys and not isinstance(primary_keys, list):
             raise ValueError("Primary keys should be provided as a list")
 
+        # Validate table name
+        self.validate_identifier(table_name, "table")
+
         # Extract all column names and their values from the list of dictionaries
         columns = self.get_all_columns(dict_list)
+
+        # Validate all column names
+        for col in columns:
+            self.validate_identifier(col, "column")
+
         columns = {key: [] for key in columns}
         for dictionary in dict_list:
             for key, value in dictionary.items():
@@ -774,76 +896,111 @@ class PostgresManager:
             key: self.determine_column_type(values) for key, values in columns.items()
         }
 
-        # Create the SQL statement for table creation
-        fields = []
+        # Validate primary keys if provided
+        if primary_keys:
+            for pk in primary_keys:
+                self.validate_identifier(pk, "primary key")
 
-        # Add identity column if no primary keys provided
-        if not primary_keys:
-            fields.append('"sql_id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY')
-            # Add other fields
-            fields.extend(f'"{col}" {col_type}' for col, col_type in columns.items())
-            fields_str = ", ".join(fields)
-            create_table_query = (
-                f'CREATE TABLE IF NOT EXISTS "{table_name}" ({fields_str})'
-            )
-        else:
-            # make primary keys the first few columns
-            priority_found = [item for item in columns if item in primary_keys]
-            remaining = [item for item in columns if item not in primary_keys]
-            ordered_columns = priority_found + remaining
+        # Build CREATE TABLE query using psycopg2.sql
+        def build_create_table_query():
+            field_parts = []
 
-            # Add fields in order: primary keys first, then remaining columns
-            fields.extend(f'"{col}" {columns[col]}' for col in ordered_columns)
+            if not primary_keys:
+                # Add identity column if no primary keys provided
+                field_parts.append(sql.SQL('"sql_id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY'))
+                for col, col_type in columns.items():
+                    field_parts.append(sql.SQL("{} {}").format(
+                        sql.Identifier(col),
+                        sql.SQL(col_type)
+                    ))
+                return sql.SQL("CREATE TABLE IF NOT EXISTS {schema}.{table} ({fields})").format(
+                    schema=sql.Identifier(self.schema),
+                    table=sql.Identifier(table_name),
+                    fields=sql.SQL(", ").join(field_parts)
+                )
+            else:
+                # Make primary keys the first few columns
+                priority_found = [item for item in columns if item in primary_keys]
+                remaining = [item for item in columns if item not in primary_keys]
+                ordered_columns = priority_found + remaining
 
-            fields_str = ", ".join(fields)
-            primary_keys_str = ", ".join(f'"{pk}"' for pk in primary_keys)
-            create_table_query = f'CREATE TABLE IF NOT EXISTS "{table_name}" ({fields_str}, PRIMARY KEY ({primary_keys_str}))'
+                for col in ordered_columns:
+                    field_parts.append(sql.SQL("{} {}").format(
+                        sql.Identifier(col),
+                        sql.SQL(columns[col])
+                    ))
+
+                pk_identifiers = [sql.Identifier(pk) for pk in primary_keys]
+                return sql.SQL("CREATE TABLE IF NOT EXISTS {schema}.{table} ({fields}, PRIMARY KEY ({pks}))").format(
+                    schema=sql.Identifier(self.schema),
+                    table=sql.Identifier(table_name),
+                    fields=sql.SQL(", ").join(field_parts),
+                    pks=sql.SQL(", ").join(pk_identifiers)
+                )
+
+        create_table_query = build_create_table_query()
+
+        def add_timestamps_and_trigger():
+            cursor = self.get_cursor()
+            try:
+                # Add timestamp columns
+                alter_created = sql.SQL(
+                    "ALTER TABLE {schema}.{table} ADD created_at timestamp DEFAULT CURRENT_TIMESTAMP NULL"
+                ).format(schema=sql.Identifier(self.schema), table=sql.Identifier(table_name))
+                alter_updated = sql.SQL(
+                    "ALTER TABLE {schema}.{table} ADD updated_at timestamp NULL"
+                ).format(schema=sql.Identifier(self.schema), table=sql.Identifier(table_name))
+                cursor.execute(alter_created)
+                cursor.execute(alter_updated)
+
+                # Create trigger
+                trigger_query = sql.SQL(
+                    "CREATE TRIGGER update_updated_at BEFORE UPDATE ON {schema}.{table} FOR EACH ROW EXECUTE FUNCTION {schema}.update_updated_at()"
+                ).format(schema=sql.Identifier(self.schema), table=sql.Identifier(table_name))
+                cursor.execute(trigger_query)
+                logging.info(f"Timestamps added to {table_name}; trigger created.")
+            finally:
+                cursor.close()
 
         try:
             # Check if table already exists
-            table_exists = self.execute_query(
-                f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}' AND table_schema = '{self.schema}')"
-            )
-            if table_exists[0].get("exists"):
+            table_exists = self.check_table_exists(table_name)
+            if table_exists:
                 logging.info(f"Table '{table_name}' already exists.")
                 if delete:
                     # Drop the table if it already exists
-                    self.execute(f"DROP TABLE {table_name}")
+                    drop_query = sql.SQL("DROP TABLE {schema}.{table}").format(
+                        schema=sql.Identifier(self.schema),
+                        table=sql.Identifier(table_name)
+                    )
+                    cursor = self.get_cursor()
+                    cursor.execute(drop_query)
+                    cursor.close()
                     logging.info(f"Table '{table_name}' dropped successfully.")
+
                     # Execute the create table query
-                    self.execute(create_table_query)
+                    cursor = self.get_cursor()
+                    cursor.execute(create_table_query)
+                    cursor.close()
                     logging.info(f"Table '{table_name}' created successfully.")
+
                     self.ensure_update_trigger_exists()
-                    timestamp_q = f"""
-                        ALTER TABLE {table_name} ADD created_at timestamp DEFAULT timezone('US/Central'::text, CURRENT_TIMESTAMP) NULL;
-                        ALTER TABLE {table_name}  ADD updated_at timestamp NULL;
-                    """
-                    trigger_q = f"""
-                        CREATE TRIGGER update_updated_at BEFORE
-                        UPDATE ON {table_name} FOR EACH ROW EXECUTE FUNCTION core.update_updated_at();
-                    """
-                    self.execute(timestamp_q)
-                    self.execute(trigger_q)
-                    logging.info(f"Timestamps added to {table_name}; trigger created.")
+                    add_timestamps_and_trigger()
+                    self._ensure_clean_transaction_state()
                     return True
                 else:
+                    self._ensure_clean_transaction_state()
                     return False
             else:
                 # Execute the create table query
-                self.execute(create_table_query)
+                cursor = self.get_cursor()
+                cursor.execute(create_table_query)
+                cursor.close()
                 logging.info(f"Table '{table_name}' created successfully.")
+
                 self.ensure_update_trigger_exists()
-                timestamp_q = f"""
-                    ALTER TABLE {table_name} ADD created_at timestamp DEFAULT timezone('US/Central'::text, CURRENT_TIMESTAMP) NULL;
-                    ALTER TABLE {table_name}  ADD updated_at timestamp NULL;
-                """
-                trigger_q = f"""
-                    CREATE TRIGGER update_updated_at BEFORE
-                    UPDATE ON {table_name} FOR EACH ROW EXECUTE FUNCTION core.update_updated_at();
-                """
-                self.execute(timestamp_q)
-                self.execute(trigger_q)
-                logging.info(f"Timestamps added to {table_name}; trigger created.")
+                add_timestamps_and_trigger()
+                self._ensure_clean_transaction_state()
                 return True
         except Exception as e:
             self.connection.rollback()
@@ -857,12 +1014,22 @@ class PostgresManager:
         :param table_name: The name of the table to check.
         :return: True if the table exists, False otherwise.
         """
+        # Validate table name
+        self.validate_identifier(table_name, "table")
+
         try:
-            # Check if table already exists
-            table_exists = self.execute_query(
-                f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}' AND table_schema = '{self.schema}')"
-            )
-            return table_exists[0].get("exists")
+            cursor = self.get_cursor()
+            # Use parameterized query for values
+            query = """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = %s AND table_schema = %s
+                )
+            """
+            cursor.execute(query, (table_name, self.schema))
+            result = cursor.fetchone()
+            cursor.close()
+            return result[0] if result else False
         except Exception as e:
             logging.error(f"Error checking if table exists: {e}")
             return False
@@ -875,16 +1042,18 @@ class PostgresManager:
         Returns:
             dict: A dictionary where keys are table names and values are dictionaries of column names and data types.
         """
-        query = f"""
+        # Use parameterized query for schema value
+        query = """
         SELECT table_name, column_name, data_type
         FROM information_schema.columns
-        WHERE table_schema = '{self.schema}'
+        WHERE table_schema = %s
         ORDER BY table_name, ordinal_position;
         """
         try:
             cursor = self.get_cursor()
-            cursor.execute(query)
+            cursor.execute(query, (self.schema,))
             rows = cursor.fetchall()
+            cursor.close()
 
             tables = {}
             for table_name, column_name, data_type in rows:
@@ -911,9 +1080,17 @@ class PostgresManager:
         if not dict_list:
             raise ValueError("The dictionary list is empty")
 
+        # Validate table name
+        self.validate_identifier(table_name, "table")
+
         # Extract all column names and their values from the list of dictionaries
         columns = self.get_all_columns(dict_list)
         columns = sorted(columns)
+
+        # Validate all column names
+        for col in columns:
+            self.validate_identifier(col, "column")
+
         columns_data = {key: [] for key in columns}
         for dictionary in dict_list:
             for key, value in dictionary.items():
@@ -925,53 +1102,48 @@ class PostgresManager:
             for key, values in columns_data.items()
         }
 
-        # Create the SQL statement for table creation without primary keys
-        fields = ", ".join(
-            ['"' + col + '" ' + col_type for col, col_type in columns_data.items()]
-        )
-        create_table_query = (
-            'CREATE TABLE IF NOT EXISTS "' + table_name + '" (' + fields + ")"
+        # Build CREATE TABLE query using psycopg2.sql
+        field_parts = [
+            sql.SQL("{} {}").format(sql.Identifier(col), sql.SQL(col_type))
+            for col, col_type in columns_data.items()
+        ]
+        create_table_query = sql.SQL("CREATE TABLE IF NOT EXISTS {schema}.{table} ({fields})").format(
+            schema=sql.Identifier(self.schema),
+            table=sql.Identifier(table_name),
+            fields=sql.SQL(", ").join(field_parts)
         )
 
         try:
             # Ensure a new cursor is used to prevent any issues with closed cursors
             with self.connection.cursor() as cursor:
                 cursor.execute(create_table_query)
-                logging.info("Dummy table '" + table_name + "' created successfully.")
+                logging.info(f"Dummy table '{table_name}' created successfully.")
 
-                # Prepare the column names for the insert query
-                column_names = ", ".join(['"' + col + '"' for col in columns])
+                # Build INSERT query using psycopg2.sql
+                col_identifiers = [sql.Identifier(col) for col in columns]
+                placeholders = sql.SQL(", ").join([sql.Placeholder()] * len(columns))
 
-                # Prepare the values placeholder for the insert query
-                values_placeholder = ", ".join(["%s" for _ in columns])
-
-                # Insert query construction
-                insert_query = (
-                    'INSERT INTO "'
-                    + table_name
-                    + '" ('
-                    + column_names
-                    + ") VALUES ("
-                    + values_placeholder
-                    + ")"
+                insert_query = sql.SQL("INSERT INTO {schema}.{table} ({columns}) VALUES ({placeholders})").format(
+                    schema=sql.Identifier(self.schema),
+                    table=sql.Identifier(table_name),
+                    columns=sql.SQL(", ").join(col_identifiers),
+                    placeholders=placeholders
                 )
 
                 # Prepare the data for insertion
                 rows = []
                 for row in dict_list:
-                    rows.append(tuple(row[col] for col in columns))
+                    rows.append(tuple(row.get(col) for col in columns))
 
                 # Execute the insert statements
                 cursor.executemany(insert_query, rows)
                 self.connection.commit()
-                logging.info(
-                    "Data successfully dumped into dummy table '" + table_name + "'."
-                )
+                logging.info(f"Data successfully dumped into dummy table '{table_name}'.")
                 return True
 
         except Exception as e:
             self.connection.rollback()
-            logging.error("Error dumping data to dummy table: " + str(e))
+            logging.error(f"Error dumping data to dummy table: {e}")
             return False
 
     def move_table_to_new_database(self, table_name, new_database, new_schema):
@@ -983,44 +1155,63 @@ class PostgresManager:
         :param new_schema: The name of the new schema to move the table to.
         :return: bool: True if the table is moved successfully, False otherwise.
         """
+        # Validate identifiers
+        self.validate_identifier(table_name, "table")
+        self.validate_identifier(new_database, "database")
+        self.validate_identifier(new_schema, "schema")
+
         try:
+            cursor = self.get_cursor()
+
             # Check if the table exists in the current schema
-            table_exists = self.execute_query(
-                f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')"
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s)",
+                (table_name,)
             )
-            if not table_exists[0].get("exists"):
-                logging.error(
-                    f"Table '{table_name}' does not exist in the current schema."
-                )
+            if not cursor.fetchone()[0]:
+                logging.error(f"Table '{table_name}' does not exist in the current schema.")
+                cursor.close()
                 return False
 
             # Check if the new schema exists
-            schema_exists = self.execute_query(
-                f"SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = '{new_schema}')"
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = %s)",
+                (new_schema,)
             )
-            if not schema_exists[0].get("exists"):
+            if not cursor.fetchone()[0]:
                 logging.error(f"Schema '{new_schema}' does not exist.")
+                cursor.close()
                 return False
 
             # Check if the new database exists
-            database_exists = self.execute_query(
-                f"SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = '{new_database}')"
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = %s)",
+                (new_database,)
             )
-            if not database_exists[0].get("exists"):
+            if not cursor.fetchone()[0]:
                 logging.error(f"Database '{new_database}' does not exist.")
+                cursor.close()
                 return False
 
             # Move the table to the new schema
-            self.execute(f"ALTER TABLE {table_name} SET SCHEMA {new_schema}")
-            logging.info(
-                f"Table '{table_name}' moved to schema '{new_schema}' successfully."
+            alter_schema_query = sql.SQL("ALTER TABLE {schema}.{table} SET SCHEMA {new_schema}").format(
+                schema=sql.Identifier(self.schema),
+                table=sql.Identifier(table_name),
+                new_schema=sql.Identifier(new_schema)
             )
+            cursor.execute(alter_schema_query)
+            logging.info(f"Table '{table_name}' moved to schema '{new_schema}' successfully.")
 
-            # Move the table to the new database
-            self.execute(f"ALTER TABLE {table_name} SET TABLESPACE {new_database}")
-            logging.info(
-                f"Table '{table_name}' moved to database '{new_database}' successfully."
+            # Move the table to the new tablespace (Note: this is tablespace, not database)
+            alter_tablespace_query = sql.SQL("ALTER TABLE {schema}.{table} SET TABLESPACE {tablespace}").format(
+                schema=sql.Identifier(new_schema),
+                table=sql.Identifier(table_name),
+                tablespace=sql.Identifier(new_database)
             )
+            cursor.execute(alter_tablespace_query)
+            logging.info(f"Table '{table_name}' moved to tablespace '{new_database}' successfully.")
+
+            cursor.close()
             return True
 
         except Exception as e:
@@ -1033,39 +1224,55 @@ class PostgresManager:
 
         :param table_name: The name of the table to move.
         :param new_schema: The name of the new schema to move the table to.
+        :param remove: If True, drop the table after moving (note: this doesn't make sense after a schema move).
         :return: bool: True if the table is moved successfully, False otherwise.
         """
+        # Validate identifiers
+        self.validate_identifier(table_name, "table")
+        self.validate_identifier(new_schema, "schema")
+
         try:
+            cursor = self.get_cursor()
+
             # Check if the table exists in the current schema
-            table_exists = self.execute_query(
-                f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')"
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s AND table_schema = %s)",
+                (table_name, self.schema)
             )
-            if not table_exists[0].get("exists"):
-                logging.error(
-                    f"Table '{table_name}' does not exist in the current schema."
-                )
+            if not cursor.fetchone()[0]:
+                logging.error(f"Table '{table_name}' does not exist in the current schema.")
+                cursor.close()
                 return False
 
             # Check if the new schema exists
-            schema_exists = self.execute_query(
-                f"SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = '{new_schema}')"
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = %s)",
+                (new_schema,)
             )
-            if not schema_exists[0].get("exists"):
+            if not cursor.fetchone()[0]:
                 logging.error(f"Schema '{new_schema}' does not exist.")
+                cursor.close()
                 return False
 
             # Move the table to the new schema
-            self.execute(f"ALTER TABLE {table_name} SET SCHEMA {new_schema}")
-            logging.info(
-                f"Table '{table_name}' moved to schema '{new_schema}' successfully."
+            alter_query = sql.SQL("ALTER TABLE {schema}.{table} SET SCHEMA {new_schema}").format(
+                schema=sql.Identifier(self.schema),
+                table=sql.Identifier(table_name),
+                new_schema=sql.Identifier(new_schema)
             )
+            cursor.execute(alter_query)
+            logging.info(f"Table '{table_name}' moved to schema '{new_schema}' successfully.")
 
-            # Remove the table from the current schema
+            # Remove the table from the new schema (if requested)
             if remove:
-                self.execute(f"DROP TABLE {table_name}")
-                logging.info(
-                    f"Table '{table_name}' removed from schema '{self.schema}' successfully."
+                drop_query = sql.SQL("DROP TABLE {schema}.{table}").format(
+                    schema=sql.Identifier(new_schema),
+                    table=sql.Identifier(table_name)
                 )
+                cursor.execute(drop_query)
+                logging.info(f"Table '{table_name}' removed from schema '{new_schema}' successfully.")
+
+            cursor.close()
             return True
 
         except Exception as e:

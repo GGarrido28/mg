@@ -4,7 +4,10 @@ Admin script for managing PostgreSQL user privileges.
 Run this to grant a user access to all databases and schemas.
 """
 import logging
+import re
+
 import psycopg2
+from psycopg2 import sql
 
 from mg.db.config import _DO_HOST, _DO_PASSWORD, _DO_USER, _DO_PORT, DB_SCHEMAS
 
@@ -12,9 +15,48 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def validate_identifier(name: str, identifier_type: str = "identifier") -> str:
+    """Validate that a string is safe to use as a SQL identifier.
+
+    Args:
+        name: The identifier to validate
+        identifier_type: Type of identifier for error messages
+
+    Returns:
+        The validated identifier
+
+    Raises:
+        ValueError: If the identifier contains invalid characters
+    """
+    if not name or not isinstance(name, str):
+        raise ValueError(f"Invalid {identifier_type}: must be a non-empty string")
+
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+        raise ValueError(
+            f"Invalid {identifier_type} '{name}': must start with letter or underscore, "
+            "and contain only alphanumeric characters and underscores"
+        )
+
+    # Note: 'source' is included as it's a reserved word in some SQL contexts
+    sql_keywords = {'select', 'insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'source'}
+    if name.lower() in sql_keywords:
+        raise ValueError(f"Invalid {identifier_type} '{name}': cannot use SQL keyword as identifier")
+
+    return name
+
+
 def grant_user_privileges(username: str):
     """Grant a user full privileges on all databases and schemas."""
+    # Validate username to prevent SQL injection
+    validate_identifier(username, "username")
+
     databases = list(DB_SCHEMAS.keys())
+
+    # Validate all database and schema names
+    for db in databases:
+        validate_identifier(db, "database")
+        for schema in DB_SCHEMAS[db]:
+            validate_identifier(schema, "schema")
 
     # Create a connection to defaultdb to grant connect privileges
     conn = psycopg2.connect(
@@ -29,7 +71,12 @@ def grant_user_privileges(username: str):
 
     logger.info(f"Granting connect privileges to {username}...")
     for db in databases:
-        cur.execute(f"GRANT CONNECT ON DATABASE {db} TO {username};")
+        cur.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {db} TO {user}").format(
+                db=sql.Identifier(db),
+                user=sql.Identifier(username)
+            )
+        )
 
     conn.close()
 
@@ -48,24 +95,47 @@ def grant_user_privileges(username: str):
 
         for schema in DB_SCHEMAS[db]:
             logger.info(f"  Granting privileges on schema: {schema}")
-            cur.execute(f"GRANT ALL PRIVILEGES ON SCHEMA {schema} TO {username};")
             cur.execute(
-                f"GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} TO {username};"
+                sql.SQL("GRANT ALL PRIVILEGES ON SCHEMA {schema} TO {user}").format(
+                    schema=sql.Identifier(schema),
+                    user=sql.Identifier(username)
+                )
             )
             cur.execute(
-                f"GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {schema} TO {username};"
+                sql.SQL("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} TO {user}").format(
+                    schema=sql.Identifier(schema),
+                    user=sql.Identifier(username)
+                )
             )
             cur.execute(
-                f"GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {schema} TO {username};"
+                sql.SQL("GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {schema} TO {user}").format(
+                    schema=sql.Identifier(schema),
+                    user=sql.Identifier(username)
+                )
             )
             cur.execute(
-                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL PRIVILEGES ON TABLES TO {username};"
+                sql.SQL("GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {schema} TO {user}").format(
+                    schema=sql.Identifier(schema),
+                    user=sql.Identifier(username)
+                )
             )
             cur.execute(
-                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL PRIVILEGES ON SEQUENCES TO {username};"
+                sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL PRIVILEGES ON TABLES TO {user}").format(
+                    schema=sql.Identifier(schema),
+                    user=sql.Identifier(username)
+                )
             )
             cur.execute(
-                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL PRIVILEGES ON FUNCTIONS TO {username};"
+                sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL PRIVILEGES ON SEQUENCES TO {user}").format(
+                    schema=sql.Identifier(schema),
+                    user=sql.Identifier(username)
+                )
+            )
+            cur.execute(
+                sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL PRIVILEGES ON FUNCTIONS TO {user}").format(
+                    schema=sql.Identifier(schema),
+                    user=sql.Identifier(username)
+                )
             )
 
         conn.close()
@@ -75,6 +145,9 @@ def grant_user_privileges(username: str):
 
 def create_user(username: str, password: str):
     """Create a new database user with CREATEDB and CREATEROLE privileges."""
+    # Validate username to prevent SQL injection
+    validate_identifier(username, "username")
+
     conn = psycopg2.connect(
         dbname="defaultdb",
         user=_DO_USER,
@@ -86,20 +159,24 @@ def create_user(username: str, password: str):
     cur = conn.cursor()
 
     logger.info(f"Creating user {username}...")
+    # Use sql.Identifier for username and sql.Literal for password
     cur.execute(
-        f"CREATE USER {username} WITH CREATEDB CREATEROLE PASSWORD '{password}';"
+        sql.SQL("CREATE USER {user} WITH CREATEDB CREATEROLE PASSWORD {password}").format(
+            user=sql.Identifier(username),
+            password=sql.Literal(password)
+        )
     )
     conn.close()
     logger.info(f"User {username} created successfully!")
 
 
 if __name__ == "__main__":
-    # import sys
+    import sys
 
-    # if len(sys.argv) < 2:
-    #     logger.error("Usage: python postgres_user.py <username>")
-    #     logger.error("  Grants full privileges to the specified user on all databases/schemas")
-    #     sys.exit(1)
+    if len(sys.argv) < 2:
+        logger.error("Usage: python postgres_user.py <username>")
+        logger.error("  Grants full privileges to the specified user on all databases/schemas")
+        sys.exit(1)
 
-    username = "gabe"
+    username = sys.argv[1]
     grant_user_privileges(username)

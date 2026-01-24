@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Any
 from datetime import datetime
+from uuid import UUID
 import uuid
 
 
@@ -14,11 +15,11 @@ class SourceEntity:
     """
 
     # Required fields
-    source: str  # Data source identifier (e.g., "draftkings", "espn")
-    source_id: str  # ID from the source system
+    data_source: str  # Data source identifier (e.g., "draftkings", "espn")
+    data_source_id: str  # ID from the source system
 
     # Auto-generated
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    id: UUID = field(default_factory=uuid.uuid4)
     created_at: datetime = field(default_factory=datetime.now)
 
     # Optional metadata
@@ -33,6 +34,6 @@ class SourceEntity:
         return {k: v for k, v in data.items() if v is not None}
 
     def __post_init__(self):
-        """Ensure source_id is a string."""
-        if self.source_id is not None:
-            self.source_id = str(self.source_id)
+        """Ensure data_source_id is a string."""
+        if self.data_source_id is not None:
+            self.data_source_id = str(self.data_source_id)

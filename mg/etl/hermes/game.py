@@ -1,11 +1,12 @@
 """Game cartographer for mapping external game IDs to internal entities."""
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from datetime import datetime, date, timedelta
 import logging
+import uuid
 
 from mg.etl.hermes.base import Cartographer
-from mg.etl.chronos import convert_str_to_datetime, convert_to_est
+from mg.etl.chronos import convert_str_to_date, convert_str_to_datetime, convert_to_est, convert_to_utc
 
 if TYPE_CHECKING:
     from mg.logging.logger_manager import LoggerManager
@@ -17,7 +18,7 @@ class GameCartographer(Cartographer):
     """Cartographer for external game IDs to internal game entities.
 
     Matches games by:
-    1. Exact source_id lookup (cached)
+    1. Exact data_source_id lookup (cached)
     2. Team IDs + date (if both team IDs provided)
     3. Single team ID + date (if only one team ID matched)
     4. Team names + date (allows swapped team order)
@@ -30,7 +31,7 @@ class GameCartographer(Cartographer):
 
     def __init__(
         self,
-        source: str,
+        data_source: str,
         db_name: str,
         schema: str = "core",
         timezone: Optional[str] = None,
@@ -41,7 +42,7 @@ class GameCartographer(Cartographer):
         """Initialize the GameCartographer.
 
         Args:
-            source: Data source identifier
+            data_source: Data source identifier
             db_name: Database name
             schema: Database schema
             timezone: Source timezone for time conversion (e.g., "UTC", "PST")
@@ -51,11 +52,11 @@ class GameCartographer(Cartographer):
         """
         self.timezone = timezone
         self.allow_swapped_teams = allow_swapped_teams
-        super().__init__(source, db_name, schema, logger, debug)
+        super().__init__(data_source, db_name, schema, logger, debug)
 
     def map(
         self,
-        source_id: str,
+        data_source_id: str,
         away_team: Optional[str] = None,
         home_team: Optional[str] = None,
         away_team_id: Optional[str] = None,
@@ -65,7 +66,7 @@ class GameCartographer(Cartographer):
         """Map a game by source ID or teams/date.
 
         Args:
-            source_id: External source identifier (required)
+            data_source_id: External source identifier (required)
             away_team: Away team name/abbreviation
             home_team: Home team name/abbreviation
             away_team_id: Internal away team ID (from TeamCartographer)
@@ -75,14 +76,14 @@ class GameCartographer(Cartographer):
         Returns:
             Matched game dict or None
         """
-        # Normalize source_id to string
-        source_id = str(source_id)
+        # Normalize data_source_id to string
+        data_source_id = str(data_source_id)
 
         # Step 1: Check cache
-        if source_id:
-            cached = self._lookup_cached(source_id)
+        if data_source_id:
+            cached = self._lookup_cached(data_source_id)
             if cached:
-                self._log(f"Cache hit: source_id={source_id}")
+                self._log(f"Cache hit: data_source_id={data_source_id}")
                 return cached
 
         # Need start_time for any matching
@@ -93,6 +94,9 @@ class GameCartographer(Cartographer):
         # Parse and normalize time
         if isinstance(start_time, str):
             game_dt = convert_str_to_datetime(start_time)
+            if game_dt is None:
+                self._log(f"Failed to parse start_time: {start_time}", level="warning")
+                return None
         else:
             game_dt = start_time
 
@@ -113,7 +117,7 @@ class GameCartographer(Cartographer):
                     "home_team_id": home_team_id,
                     "date": str(game_date),
                 }
-                self._add_mapping(source_id, game, confidence_rating=100, log_info=log_info)
+                self._add_mapping(data_source_id, game, confidence_rating=100, log_info=log_info)
                 self._log(f"Matched by team IDs: {away_team_id} @ {home_team_id} on {game_date}")
                 return game
 
@@ -126,7 +130,7 @@ class GameCartographer(Cartographer):
                         "home_team_id": home_team_id,
                         "datetime": str(game_dt),
                     }
-                    self._add_mapping(source_id, game, confidence_rating=95, log_info=log_info)
+                    self._add_mapping(data_source_id, game, confidence_rating=95, log_info=log_info)
                     self._log(f"Matched by team IDs + time: {away_team_id} @ {home_team_id}")
                     return game
 
@@ -142,7 +146,7 @@ class GameCartographer(Cartographer):
                     "team_id": single_team_id,
                     "date": str(game_date),
                 }
-                self._add_mapping(source_id, game, confidence_rating=85, log_info=log_info)
+                self._add_mapping(data_source_id, game, confidence_rating=85, log_info=log_info)
                 self._log(f"Matched by single team ID: {single_team_id} on {game_date}")
                 return game
 
@@ -154,16 +158,13 @@ class GameCartographer(Cartographer):
                         "team_id": single_team_id,
                         "datetime": str(game_dt),
                     }
-                    self._add_mapping(source_id, game, confidence_rating=80, log_info=log_info)
+                    self._add_mapping(data_source_id, game, confidence_rating=80, log_info=log_info)
                     self._log(f"Matched by single team ID + time: {single_team_id}")
                     return game
 
         # Step 4: Match by team names + date
         if away_team and home_team:
-            away = self._normalize_team(away_team)
-            home = self._normalize_team(home_team)
-
-            matches = self._match_by_teams_date(away, home, game_date)
+            matches = self._match_by_teams_date(away_team, home_team, game_date)
 
             if len(matches) == 1:
                 game = matches[0]
@@ -173,8 +174,8 @@ class GameCartographer(Cartographer):
                     "home_team": home_team,
                     "date": str(game_date),
                 }
-                self._add_mapping(source_id, game, confidence_rating=100, log_info=log_info)
-                self._log(f"Matched: {away} @ {home} on {game_date}")
+                self._add_mapping(data_source_id, game, confidence_rating=100, log_info=log_info)
+                self._log(f"Matched: {away_team} @ {home_team} on {game_date}")
                 return game
 
             if len(matches) > 1:
@@ -186,14 +187,14 @@ class GameCartographer(Cartographer):
                         "home_team": home_team,
                         "datetime": str(game_dt),
                     }
-                    self._add_mapping(source_id, game, confidence_rating=90, log_info=log_info)
-                    self._log(f"Matched by time: {away} @ {home}")
+                    self._add_mapping(data_source_id, game, confidence_rating=90, log_info=log_info)
+                    self._log(f"Matched by time: {away_team} @ {home_team}")
                     return game
 
         # No match found
         self._log(
-            f"Cannot map game: source={self.source}, "
-            f"source_id={source_id}, {away_team or away_team_id}@{home_team or home_team_id} {start_time}",
+            f"Cannot map game: data_source={self.data_source}, "
+            f"data_source_id={data_source_id}, {away_team or away_team_id}@{home_team or home_team_id} {start_time}",
             level="warning",
         )
         return None
@@ -209,7 +210,7 @@ class GameCartographer(Cartographer):
         for game in self.entities:
             game_away_id = str(game.get("away_team_id", ""))
             game_home_id = str(game.get("home_team_id", ""))
-            game_day = game.get("day")
+            game_day = game.get("game_date")
 
             if game_day is None:
                 continue
@@ -245,7 +246,7 @@ class GameCartographer(Cartographer):
         for game in self.entities:
             game_away_id = str(game.get("away_team_id", ""))
             game_home_id = str(game.get("home_team_id", ""))
-            game_day = game.get("day")
+            game_day = game.get("game_date")
 
             if game_day is None:
                 continue
@@ -273,7 +274,7 @@ class GameCartographer(Cartographer):
         for game in self.entities:
             game_away = game.get("away_team", "")
             game_home = game.get("home_team", "")
-            game_day = game.get("day")
+            game_day = game.get("game_date")
 
             if game_day is None:
                 continue
@@ -304,7 +305,7 @@ class GameCartographer(Cartographer):
         best_diff = timedelta.max
 
         for game in candidates:
-            game_time = game.get("datetime") or game.get("date_time")
+            game_time = game.get("start_time") or game.get("datetime")
             if game_time is None:
                 continue
 
@@ -332,3 +333,195 @@ class GameCartographer(Cartographer):
             return best_match
 
         return None
+
+    def get_or_create(
+        self,
+        data_source_id: str,
+        away_team_id: Optional[str] = None,
+        home_team_id: Optional[str] = None,
+        data_source_away_team_id: Optional[str] = None,
+        data_source_home_team_id: Optional[str] = None,
+        away_team: Optional[str] = None,
+        home_team: Optional[str] = None,
+        data_source_away_team: Optional[str] = None,
+        data_source_home_team: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        game_date: Optional[date] = None,
+        timezone: Optional[str] = None,
+        status: Optional[str] = None,
+        period: Optional[str] = None,
+        clock: Optional[str] = None,
+        away_score: Optional[int] = None,
+        home_score: Optional[int] = None,
+        venue: Optional[str] = None,
+        venue_city: Optional[str] = None,
+        venue_state: Optional[str] = None,
+        is_neutral_site: bool = False,
+        season: Optional[int] = None,
+        season_type: Optional[str] = None,
+        week: Optional[int] = None,
+        game_number: Optional[int] = None,
+        ppd: bool = False,
+        broadcast: Optional[str] = None,
+        broadcast_networks: Optional[list[str]] = None,
+        weather: Optional[str] = None,
+        temperature: Optional[int] = None,
+        wind: Optional[str] = None,
+        dome: bool = False,
+    ) -> dict:
+        """Get existing game or create a new one.
+
+        Args:
+            data_source_id: External source identifier (required)
+            away_team_id: Internal away team ID
+            home_team_id: Internal home team ID
+            data_source_away_team_id: Away team ID from source
+            data_source_home_team_id: Home team ID from source
+            away_team: Away team name
+            home_team: Home team name
+            data_source_away_team: Away team name from source
+            data_source_home_team: Home team name from source
+            start_time: Game start datetime
+            game_date: Game date
+            timezone: Source timezone
+            status: Game status
+            period: Current period
+            clock: Game clock
+            away_score: Away team score
+            home_score: Home team score
+            venue: Stadium/arena name
+            venue_city: Venue city
+            venue_state: Venue state
+            is_neutral_site: Whether played at neutral site
+            season: Season year
+            season_type: Type of season
+            week: Week number
+            game_number: Game number in series
+            ppd: Postponed flag
+            broadcast: Primary broadcast network
+            broadcast_networks: List of broadcast networks
+            weather: Weather conditions
+            temperature: Temperature in Fahrenheit
+            wind: Wind conditions
+            dome: Whether played in dome
+
+        Returns:
+            Game dict with ID (existing or newly created)
+        """
+        data_source_id = str(data_source_id)
+
+        # Try to find existing game
+        existing = self.map(
+            data_source_id=data_source_id,
+            away_team=away_team,
+            home_team=home_team,
+            away_team_id=away_team_id,
+            home_team_id=home_team_id,
+            start_time=start_time,
+        )
+
+        if existing:
+            game_id = existing["id"]
+            self._log(f"Found existing game: {data_source_id} -> {game_id}")
+        else:
+            game_id = uuid.uuid4()
+            self._log(f"Creating new game: {data_source_id} -> {game_id}")
+
+        # Parse start_time if it's a string
+        start_time_dt = None
+        if start_time:
+            if isinstance(start_time, str):
+                start_time_dt = convert_str_to_datetime(start_time)
+                if start_time_dt is None:
+                    self._log(f"Failed to parse start_time: {start_time}", level="warning")
+            else:
+                start_time_dt = start_time
+
+        # Parse game_date if it's a string
+        game_date_parsed = None
+        if game_date:
+            if isinstance(game_date, str):
+                game_date_parsed = convert_str_to_date(game_date)
+                if game_date_parsed is None:
+                    self._log(f"Failed to parse game_date: {game_date}", level="warning")
+            else:
+                game_date_parsed = game_date
+
+        # Extract date from start_time if not provided
+        if start_time_dt and not game_date_parsed:
+            game_date_parsed = start_time_dt.date()
+
+        # Compute UTC conversions if timezone is provided
+        start_time_utc = None
+        game_date_utc = None
+        effective_tz = timezone or self.timezone
+        if start_time_dt and effective_tz:
+            try:
+                start_time_utc = convert_to_utc(start_time_dt, effective_tz)
+                game_date_utc = start_time_utc.date()
+            except ValueError as e:
+                self._log(f"Failed to convert to UTC: {e}", level="warning")
+
+        # Build game entity with all fields (ordered for logical column grouping)
+        game = {
+            # Identifiers
+            "id": game_id,
+            "data_source_id": data_source_id,
+            # Team IDs
+            "away_team_id": away_team_id,
+            "home_team_id": home_team_id,
+            "data_source_away_team_id": data_source_away_team_id,
+            "data_source_home_team_id": data_source_home_team_id,
+            # Team names
+            "away_team": away_team.strip() if away_team else None,
+            "home_team": home_team.strip() if home_team else None,
+            "data_source_away_team": data_source_away_team.strip() if data_source_away_team else None,
+            "data_source_home_team": data_source_home_team.strip() if data_source_home_team else None,
+            # Timing (date first, then time, then timezone)
+            "game_date": game_date_parsed,
+            "game_date_utc": game_date_utc,
+            "start_time": start_time_dt,
+            "start_time_utc": start_time_utc,
+            "timezone": effective_tz,
+            # Game state
+            "status": status,
+            "period": period,
+            "clock": clock,
+            # Scores
+            "away_score": away_score,
+            "home_score": home_score,
+            # Venue
+            "venue": venue.strip() if venue else None,
+            "venue_city": venue_city.strip() if venue_city else None,
+            "venue_state": venue_state.strip() if venue_state else None,
+            "is_neutral_site": is_neutral_site,
+            # Season info
+            "season": season,
+            "season_type": season_type,
+            "week": week,
+            "game_number": game_number,
+            # Misc
+            "ppd": ppd,
+            "broadcast": broadcast,
+            "broadcast_networks": broadcast_networks,
+            "weather": weather,
+            "temperature": temperature,
+            "wind": wind,
+            "dome": dome,
+            # Source (before system timestamps)
+            "data_source": self.data_source,
+        }
+
+        # Remove None values
+        game = {k: v for k, v in game.items() if v is not None}
+
+        # Add to cache and pending entities
+        self.cache[data_source_id] = game
+        self._pending_entities.append(game)
+
+        # Add mapping to pending (for source_map table)
+        if not existing:
+            log_info = {"method": "get_or_create", "away_team": away_team, "home_team": home_team}
+            self._add_mapping(data_source_id, game, confidence_rating=100, log_info=log_info)
+
+        return game
