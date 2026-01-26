@@ -14,7 +14,7 @@ _SS_USER = os.getenv("SS_USER")
 # Database to schema mapping
 DB_SCHEMAS = {
     "cfb": ["core", "draftkings", "underdog"],
-    "defaultdb": ["control", "data", "draftkings", "fanduel", "underdog"],
+    "defaultdb": ["control", "data", "draftkings", "fanduel", "underdog", "tennis"],
     "golf": ["core", "draftkings"],
     "mlb": ["core", "draftkings", "fanduel"],
     "mma": ["core", "draftkings"],
@@ -60,6 +60,14 @@ POSTGRES_HOSTS = {
             "underdog": {
                 "database": "defaultdb",
                 "schema": "underdog",
+                "host": _DO_HOST,
+                "user": _DO_USER,
+                "password": _DO_PASSWORD,
+                "port": _DO_PORT,
+            },
+            "tennis": {
+                "database": "defaultdb",
+                "schema": "tennis",
                 "host": _DO_HOST,
                 "user": _DO_USER,
                 "password": _DO_PASSWORD,
