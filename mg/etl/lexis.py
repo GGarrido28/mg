@@ -174,7 +174,7 @@ def strip_convert_to_lowercase(string: str, strip_suffixes: bool = True) -> str:
     return new_string
 
 
-def split_name_parts(string: str, strip_suffixes: bool = True) -> List[str, str]:
+def split_name_parts(string: str, strip_suffixes: bool = True) -> tuple[str, str]:
     """Split human full names into parts: first name and last name.
 
     First word becomes first name, remaining words become last name.
@@ -185,7 +185,7 @@ def split_name_parts(string: str, strip_suffixes: bool = True) -> List[str, str]
         strip_suffixes: If True, removes suffixes
 
     Returns:
-        List containing [first_name, last_name].
+        Tuple containing (first_name, last_name).
     """
     if strip_suffixes:
         string = strip_suffix(string)
@@ -201,7 +201,7 @@ def split_name_parts(string: str, strip_suffixes: bool = True) -> List[str, str]
             last_name += name_parts[i] + " "
         i += 1
     last_name = last_name[: len(last_name) - 1]
-    return [first_name, last_name]
+    return (first_name, last_name)
 
 
 def normalize_name(string: str, include_suffixes: bool = True) -> str:

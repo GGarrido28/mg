@@ -57,7 +57,7 @@ class PlayerCartographer(Cartographer):
         self.position_mapping = position_mapping or {}
         self.similarity_threshold = similarity_threshold
         self.team_cartographer = team_cartographer
-        super().__init__(data_source, db_name, schema, logger, debug)
+        super().__init__(data_source, db_name, schema, logger, debug, normalize_cache_keys=True)
 
     def _build_indices(self) -> None:
         """Build lookup indices for efficient name matching."""
@@ -83,6 +83,8 @@ class PlayerCartographer(Cartographer):
 
     def _get_full_name(self, player: dict) -> Optional[str]:
         """Extract full name from player dict."""
+        if player.get("player_name"):
+            return player["player_name"]
         if player.get("fullname"):
             return player["fullname"]
         if player.get("full_name"):
@@ -101,6 +103,7 @@ class PlayerCartographer(Cartographer):
         team: Optional[str] = None,
         team_id: Optional[str] = None,
         position: Optional[str] = None,
+        silent_match_log: bool = False,
     ) -> Optional[dict]:
         """Map a player by source ID or name/team/position.
 
@@ -110,12 +113,15 @@ class PlayerCartographer(Cartographer):
             team: Team name/abbreviation
             team_id: Internal team ID (from TeamCartographer)
             position: Position
+            silent_match_log: If True, suppress warning logs when no match is found
 
         Returns:
             Matched player dict or None
         """
-        # Normalize data_source_id to string
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
         data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Step 1: Check cache
         if data_source_id:
@@ -201,12 +207,13 @@ class PlayerCartographer(Cartographer):
                     self._log(f"Fuzzy match: {name} (confidence={confidence_rating})")
                     return best_match
 
-        # No match found
-        self._log(
-            f"Cannot map player: data_source={self.data_source}, "
-            f"data_source_id={data_source_id}, name={name}, team={team}",
-            level="warning",
-        )
+        if not silent_match_log:
+            # No match found
+            self._log(
+                f"Cannot map player: data_source={self.data_source}, "
+                f"data_source_id={data_source_id}, name={name}, team={team}",
+                level="warning",
+            )
         return None
 
     def _filter_by_team_position(
@@ -267,7 +274,10 @@ class PlayerCartographer(Cartographer):
         Returns:
             Player dict with ID (existing or newly created)
         """
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
         data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Try to find existing player
         existing = self.map(
@@ -276,6 +286,7 @@ class PlayerCartographer(Cartographer):
             team=team_name,
             team_id=team_id,
             position=position,
+            silent_match_log=True,  # Suppress logging for existence check
         )
 
         if existing:

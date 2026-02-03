@@ -72,6 +72,7 @@ class CronManager:
             "fightodds",
             "ourlads",
             "bestball",
+            "simsavant",
         ]
 
         for subdir in subdirs:
@@ -340,7 +341,7 @@ class CronManager:
             "\n# Clear any existing cron jobs\n",
             "crontab -r\n\n",
             "# Ensure log directories exist\n",
-            "mkdir -p ~/Documents/cron_logs/{draftkings,underdog,oddsjam,etr,rotogrinders,blitz,fightodds,ourlads,bestball}\n",
+            "mkdir -p ~/Documents/cron_logs/{draftkings,underdog,oddsjam,etr,rotogrinders,blitz,fightodds,ourlads,bestball,simsavant}\n",
             "mkdir -p ~/Documents/cron_wrappers\n\n",
         ]
 

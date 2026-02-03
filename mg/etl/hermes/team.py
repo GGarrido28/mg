@@ -19,11 +19,12 @@ class TeamCartographer(Cartographer):
     Matches teams by:
     1. Exact data_source_id lookup (cached)
     2. Exact normalized full name (confidence: 100)
-    3. Abbreviation match (confidence: 95)
-    4. Location match (confidence: 90)
-    5. Mascot match (confidence: 85)
-    6. Token overlap match (confidence: 80)
-    7. Fuzzy similarity match (confidence: based on similarity score)
+    3. Alternate name match (confidence: 98)
+    4. Abbreviation match (confidence: 95)
+    5. Location match (confidence: 90)
+    6. Mascot match (confidence: 85)
+    7. Token overlap match (confidence: 80)
+    8. Fuzzy similarity match (confidence: based on similarity score)
     """
 
     SOURCE_MAP_TABLE = "team_source_map"
@@ -56,7 +57,7 @@ class TeamCartographer(Cartographer):
         self.team_mapping = team_mapping or {}
         self.name_column = name_column
         self.similarity_threshold = similarity_threshold
-        super().__init__(data_source, db_name, schema, logger, debug)
+        super().__init__(data_source, db_name, schema, logger, debug, normalize_cache_keys=True)
 
     def _normalize_team(self, name: str) -> str:
         """Normalize a team name using the team_mapping."""
@@ -65,11 +66,13 @@ class TeamCartographer(Cartographer):
     def _build_indices(self) -> None:
         """Build lookup indices for team matching."""
         self._by_normalized_name: dict[str, dict] = {}
+        self._by_alternate_name: dict[str, dict] = {}
         self._by_abbreviation: dict[str, dict] = {}
         self._by_location: dict[str, dict] = {}
         self._by_mascot: dict[str, dict] = {}
         self._team_tokens: list[tuple[set[str], dict]] = []
 
+        self.entities = sorted(self.entities, key=lambda t: t.get(self.name_column) or t.get("team_name") or "")
         for team in self.entities:
             # Index by full team name
             name = team.get(self.name_column) or team.get("teamname") or ""
@@ -80,6 +83,13 @@ class TeamCartographer(Cartographer):
                 # Build token set for token matching
                 tokens = set(name.lower().split())
                 self._team_tokens.append((tokens, team))
+
+            # Index by alternate names
+            alternate_names = team.get("alternate_names") or []
+            for alt_name in alternate_names:
+                if alt_name:
+                    normalized_alt = strip_convert_to_lowercase(alt_name)
+                    self._by_alternate_name[normalized_alt] = team
 
             # Index by abbreviation
             abbrev = team.get("abbreviation") or team.get("abbrev") or ""
@@ -103,18 +113,22 @@ class TeamCartographer(Cartographer):
         self,
         data_source_id: str,
         name: Optional[str] = None,
+        silent_match_log: bool = False,
     ) -> Optional[dict]:
         """Map a team by source ID or name.
 
         Args:
             data_source_id: External source identifier (required)
             name: Team name (full name, location, or mascot)
+            silent_match_log: If True, suppress warning logs when no match is found
 
         Returns:
             Matched team dict or None
         """
-        # Normalize data_source_id to string
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
         data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Check cache
         if data_source_id:
@@ -139,7 +153,15 @@ class TeamCartographer(Cartographer):
             self._log(f"Exact name match: {name}")
             return team
 
-        # Step 2: Abbreviation match (confidence: 95)
+        # Step 2: Alternate name match (confidence: 98)
+        team = self._by_alternate_name.get(normalized)
+        if team:
+            log_info = {"method": "alternate_name", "input_name": name}
+            self._add_mapping(data_source_id, team, confidence_rating=98, log_info=log_info)
+            self._log(f"Alternate name match: {name}")
+            return team
+
+        # Step 3: Abbreviation match (confidence: 95)
         team = self._by_abbreviation.get(normalized)
         if team:
             log_info = {"method": "abbreviation", "input_name": name}
@@ -147,7 +169,7 @@ class TeamCartographer(Cartographer):
             self._log(f"Abbreviation match: {name}")
             return team
 
-        # Step 3: Location match (confidence: 90)
+        # Step 4: Location match (confidence: 90)
         team = self._by_location.get(normalized)
         if team:
             log_info = {"method": "location", "input_name": name}
@@ -155,7 +177,7 @@ class TeamCartographer(Cartographer):
             self._log(f"Location match: {name}")
             return team
 
-        # Step 4: Mascot match (confidence: 85)
+        # Step 5: Mascot match (confidence: 85)
         team = self._by_mascot.get(normalized)
         if team:
             log_info = {"method": "mascot", "input_name": name}
@@ -163,7 +185,7 @@ class TeamCartographer(Cartographer):
             self._log(f"Mascot match: {name}")
             return team
 
-        # Step 5: Token overlap match (confidence: 80)
+        # Step 6: Token overlap match (confidence: 80)
         team = self._match_by_tokens(mapped_name)
         if team:
             log_info = {"method": "token_overlap", "input_name": name}
@@ -171,7 +193,7 @@ class TeamCartographer(Cartographer):
             self._log(f"Token overlap match: {name}")
             return team
 
-        # Step 6: Fuzzy similarity match
+        # Step 7: Fuzzy similarity match
         team, similarity = self._match_by_similarity(mapped_name)
         if team:
             confidence_rating = int(similarity * 100)
@@ -184,12 +206,13 @@ class TeamCartographer(Cartographer):
             self._log(f"Fuzzy match: {name} (confidence={confidence_rating})")
             return team
 
-        # No match found
-        self._log(
-            f"Cannot map team: data_source={self.data_source}, "
-            f"data_source_id={data_source_id}, name={name}",
-            level="warning",
-        )
+        if not silent_match_log:
+            # No match found
+            self._log(
+                f"Cannot map team: data_source={self.data_source}, "
+                f"data_source_id={data_source_id}, name={name}",
+                level="warning",
+            )
         return None
 
     def _match_by_tokens(self, input_name: str) -> Optional[dict]:
@@ -262,10 +285,13 @@ class TeamCartographer(Cartographer):
         Returns:
             Team dict with ID (existing or newly created)
         """
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
         data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Try to find existing team
-        existing = self.map(data_source_id=data_source_id, name=team_name)
+        existing = self.map(data_source_id=data_source_id, name=team_name, silent_match_log=True)
 
         if existing:
             team_id = existing["id"]
