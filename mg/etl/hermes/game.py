@@ -78,8 +78,10 @@ class GameCartographer(Cartographer):
         Returns:
             Matched game dict or None
         """
-        # Normalize data_source_id to lowercase string for case-insensitive matching
-        data_source_id = str(data_source_id).lower()
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
+        data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Step 1: Check cache
         if data_source_id:
@@ -411,8 +413,10 @@ class GameCartographer(Cartographer):
         Returns:
             Game dict with ID (existing or newly created)
         """
-        # Normalize to lowercase for case-insensitive matching
-        data_source_id = str(data_source_id).lower()
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
+        data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Try to find existing game
         existing = self.map(

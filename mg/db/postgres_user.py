@@ -151,8 +151,12 @@ def generate_password(length: int = 24) -> str:
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
-def create_user(username: str) -> str:
+def create_user(username: str, print_password: bool = True) -> str:
     """Create a new database user with CREATEDB and CREATEROLE privileges.
+
+    Args:
+        username: The username to create
+        print_password: If True, print the password to stdout (default: True)
 
     Returns:
         The auto-generated password for the new user.
@@ -184,23 +188,28 @@ def create_user(username: str) -> str:
     conn.close()
     logger.info(f"User {username} created successfully!")
 
-    print(f"\n{'='*50}")
-    print(f"User '{username}' created with password:")
-    print(f"  {password}")
-    print(f"{'='*50}\n")
+    if print_password:
+        print(f"\n{'='*50}")
+        print(f"User '{username}' created with password:")
+        print(f"  {password}")
+        print(f"{'='*50}\n")
 
     return password
 
 
 if __name__ == "__main__":
-    # import sys
+    import sys
 
-    # if len(sys.argv) < 2:
-    #     logger.error("Usage: python postgres_user.py <username>")
-    #     logger.error("  Grants full privileges to the specified user on all databases/schemas")
-    #     sys.exit(1)
+    if len(sys.argv) < 2:
+        logger.error("Usage: python postgres_user.py <username> [--create]")
+        logger.error("  Grants full privileges to the specified user on all databases/schemas")
+        logger.error("  --create: Create the user first (will generate and display password)")
+        sys.exit(1)
 
-    # username = sys.argv[1]
-    grant_user_privileges("do_droplet")
+    username = sys.argv[1]
+    create_flag = "--create" in sys.argv
 
-    # create_user("do_droplet")
+    if create_flag:
+        create_user(username)
+
+    grant_user_privileges(username)

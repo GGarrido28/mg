@@ -125,9 +125,10 @@ class TeamCartographer(Cartographer):
         Returns:
             Matched team dict or None
         """
-        # Normalize data_source_id to lowercase string for case-insensitive matching
-        # (team names like "1WIN", "1Win", "1win" should all match the same team)
-        data_source_id = str(data_source_id).lower()
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
+        data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Check cache
         if data_source_id:
@@ -284,8 +285,10 @@ class TeamCartographer(Cartographer):
         Returns:
             Team dict with ID (existing or newly created)
         """
-        # Normalize to lowercase for case-insensitive matching
-        data_source_id = str(data_source_id).lower()
+        # Normalize data_source_id to string, optionally lowercase for case-insensitive matching
+        data_source_id = str(data_source_id)
+        if self.normalize_cache_keys:
+            data_source_id = data_source_id.lower()
 
         # Try to find existing team
         existing = self.map(data_source_id=data_source_id, name=team_name, silent_match_log=True)

@@ -45,6 +45,7 @@ def validate_schema(schema: str) -> str:
 
 
 # Entity configuration mapping
+# NOTE: All table/column values here are trusted constants validated at module load time
 ENTITY_CONFIG = {
     "team": {
         "table": "teams",
@@ -68,6 +69,17 @@ ENTITY_CONFIG = {
         "display_columns": ["id", "away_team", "home_team", "game_date", "data_source"],
     },
 }
+
+# Validate all ENTITY_CONFIG values at module load time to prevent SQL injection
+def _validate_entity_config():
+    """Validate all SQL identifiers in ENTITY_CONFIG at module load time."""
+    for entity_type, config in ENTITY_CONFIG.items():
+        for key in ["table", "source_map_table", "id_column", "name_column"]:
+            PostgresManager.validate_identifier(config[key], f"ENTITY_CONFIG[{entity_type}][{key}]")
+        for col in config["display_columns"]:
+            PostgresManager.validate_identifier(col, f"ENTITY_CONFIG[{entity_type}].display_columns")
+
+_validate_entity_config()
 
 # Common data sources for quick selection
 COMMON_DATA_SOURCES = ["draftkings", "prizepicks", "underdog", "hltv", "manual"]
@@ -604,10 +616,14 @@ def main() -> int:
             change_others = input("Change sport/entity/source? (y/n): ").strip().lower()
             if change_others in ("y", "yes"):
                 new_sport = input(f"Sport [{inputs['sport']}]: ").strip()
-                if new_sport:
+                if new_sport and new_sport != inputs["sport"]:
+                    # Close old connection before creating new one
+                    try:
+                        pgm.close()
+                    except Exception:
+                        pass  # Ignore errors when closing
                     inputs["sport"] = new_sport
                     # Reconnect to new schema
-                    pgm.close()
                     pgm = PostgresManager(
                         host="digital_ocean",
                         database="postgres",
