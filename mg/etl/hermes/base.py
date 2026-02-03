@@ -42,6 +42,7 @@ class Cartographer(ABC):
         schema: str = "core",
         logger: Optional["LoggerManager"] = None,
         debug: bool = False,
+        normalize_cache_keys: bool = False,
     ):
         """Initialize the mapper.
 
@@ -51,12 +52,15 @@ class Cartographer(ABC):
             schema: Database schema (default: "core")
             logger: Optional LoggerManager instance for structured logging
             debug: Enable debug logging (also enables verbose SQL logging)
+            normalize_cache_keys: If True, normalize cache keys to lowercase for
+                case-insensitive matching (useful when data_source_id can be names)
         """
         self.data_source = data_source
         self.db_name = db_name
         self.schema = schema
         self.logger = logger
         self.debug = debug
+        self.normalize_cache_keys = normalize_cache_keys
 
         # Validate class-level SQL identifiers to prevent injection
         PostgresManager.validate_identifier(self.SOURCE_MAP_TABLE, "SOURCE_MAP_TABLE")
@@ -87,8 +91,9 @@ class Cartographer(ABC):
 
     def _load_cache(self) -> None:
         """Load existing mappings from the map table into cache."""
+        # Use alias for m.data_source_id to avoid collision with e.data_source_id
         query = f"""
-            SELECT m.data_source_id, m.entity_id, m.log_info, e.*
+            SELECT m.data_source_id AS map_data_source_id, m.entity_id, m.log_info, e.*
             FROM {self.schema}.{self.SOURCE_MAP_TABLE} m
             JOIN {self.schema}.{self.ENTITY_TABLE} e ON m.entity_id = e.{self.ENTITY_ID_COLUMN}
             WHERE m.data_source = %(data_source)s
@@ -97,7 +102,10 @@ class Cartographer(ABC):
         if self.debug:
             logging.info(f"[{self.__class__.__name__}] Loaded {len(rows)} cached mappings for data_source='{self.data_source}'")
         for row in rows:
-            self.cache[str(row["data_source_id"])] = row
+            key = str(row["map_data_source_id"])
+            if self.normalize_cache_keys:
+                key = key.lower()
+            self.cache[key] = row
 
     def _load_entities(self) -> None:
         """Load entities not already mapped for this data_source."""
@@ -168,7 +176,10 @@ class Cartographer(ABC):
         Returns:
             Cached entity dict or None
         """
-        return self.cache.get(str(data_source_id))
+        key = str(data_source_id)
+        if self.normalize_cache_keys:
+            key = key.lower()
+        return self.cache.get(key)
 
     def _add_mapping(
         self,
@@ -186,7 +197,8 @@ class Cartographer(ABC):
             log_info: Information about how the match was made
         """
         data_source_id = str(data_source_id)
-        self.cache[data_source_id] = entity
+        cache_key = data_source_id.lower() if self.normalize_cache_keys else data_source_id
+        self.cache[cache_key] = entity
 
         self._pending.append({
             "data_source": self.data_source,
@@ -253,5 +265,6 @@ class Cartographer(ABC):
     def close(self) -> None:
         """Close the database connection and logger if present."""
         self.pgm.close()
-        if self.logger:
+        # Only call close_logger() if it exists (custom LoggerManager, not standard Python logger)
+        if self.logger and hasattr(self.logger, 'close_logger'):
             self.logger.close_logger()

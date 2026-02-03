@@ -52,7 +52,7 @@ class GameCartographer(Cartographer):
         """
         self.timezone = timezone
         self.allow_swapped_teams = allow_swapped_teams
-        super().__init__(data_source, db_name, schema, logger, debug)
+        super().__init__(data_source, db_name, schema, logger, debug, normalize_cache_keys=True)
 
     def map(
         self,
@@ -62,6 +62,7 @@ class GameCartographer(Cartographer):
         away_team_id: Optional[str] = None,
         home_team_id: Optional[str] = None,
         start_time: Optional[datetime | str] = None,
+        silent_match_log: bool = False,
     ) -> Optional[dict]:
         """Map a game by source ID or teams/date.
 
@@ -72,12 +73,13 @@ class GameCartographer(Cartographer):
             away_team_id: Internal away team ID (from TeamCartographer)
             home_team_id: Internal home team ID (from TeamCartographer)
             start_time: Game start time (datetime or string)
+            silent_match_log: If True, suppress warning logs when no match is found
 
         Returns:
             Matched game dict or None
         """
-        # Normalize data_source_id to string
-        data_source_id = str(data_source_id)
+        # Normalize data_source_id to lowercase string for case-insensitive matching
+        data_source_id = str(data_source_id).lower()
 
         # Step 1: Check cache
         if data_source_id:
@@ -191,12 +193,13 @@ class GameCartographer(Cartographer):
                     self._log(f"Matched by time: {away_team} @ {home_team}")
                     return game
 
-        # No match found
-        self._log(
-            f"Cannot map game: data_source={self.data_source}, "
-            f"data_source_id={data_source_id}, {away_team or away_team_id}@{home_team or home_team_id} {start_time}",
-            level="warning",
-        )
+        if not silent_match_log:
+            # No match found
+            self._log(
+                f"Cannot map game: data_source={self.data_source}, "
+                f"data_source_id={data_source_id}, {away_team or away_team_id}@{home_team or home_team_id} {start_time}",
+                level="warning",
+            )
         return None
 
     def _match_by_team_ids_date(
@@ -408,7 +411,8 @@ class GameCartographer(Cartographer):
         Returns:
             Game dict with ID (existing or newly created)
         """
-        data_source_id = str(data_source_id)
+        # Normalize to lowercase for case-insensitive matching
+        data_source_id = str(data_source_id).lower()
 
         # Try to find existing game
         existing = self.map(
@@ -418,6 +422,7 @@ class GameCartographer(Cartographer):
             away_team_id=away_team_id,
             home_team_id=home_team_id,
             start_time=start_time,
+            silent_match_log=True,  # Suppress logging for existence check
         )
 
         if existing:
