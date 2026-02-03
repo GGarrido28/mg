@@ -5,6 +5,8 @@ Run this to grant a user access to all databases and schemas.
 """
 import logging
 import re
+import secrets
+import string
 
 import psycopg2
 from psycopg2 import sql
@@ -143,10 +145,23 @@ def grant_user_privileges(username: str):
     logger.info(f"All privileges granted to {username} successfully!")
 
 
-def create_user(username: str, password: str):
-    """Create a new database user with CREATEDB and CREATEROLE privileges."""
+def generate_password(length: int = 24) -> str:
+    """Generate a secure random password."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+def create_user(username: str) -> str:
+    """Create a new database user with CREATEDB and CREATEROLE privileges.
+
+    Returns:
+        The auto-generated password for the new user.
+    """
     # Validate username to prevent SQL injection
     validate_identifier(username, "username")
+
+    # Auto-generate a secure password
+    password = generate_password()
 
     conn = psycopg2.connect(
         dbname="defaultdb",
@@ -169,14 +184,23 @@ def create_user(username: str, password: str):
     conn.close()
     logger.info(f"User {username} created successfully!")
 
+    print(f"\n{'='*50}")
+    print(f"User '{username}' created with password:")
+    print(f"  {password}")
+    print(f"{'='*50}\n")
+
+    return password
+
 
 if __name__ == "__main__":
-    import sys
+    # import sys
 
-    if len(sys.argv) < 2:
-        logger.error("Usage: python postgres_user.py <username>")
-        logger.error("  Grants full privileges to the specified user on all databases/schemas")
-        sys.exit(1)
+    # if len(sys.argv) < 2:
+    #     logger.error("Usage: python postgres_user.py <username>")
+    #     logger.error("  Grants full privileges to the specified user on all databases/schemas")
+    #     sys.exit(1)
 
-    username = sys.argv[1]
-    grant_user_privileges(username)
+    # username = sys.argv[1]
+    grant_user_privileges("do_droplet")
+
+    # create_user("do_droplet")
